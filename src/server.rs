@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize, Serializer};
 
 #[derive(Serialize, Deserialize)]
-pub struct Client {
+pub struct ClientInfo {
     name: String,
 }
 
@@ -19,12 +19,11 @@ impl Serialize for GameStatus {
         S: Serializer,
     {
         match self {
-            InLobby => serializer.serialize_str("in_lobby"),
-            Starting => serializer.serialize_str("starting"),
-            InProgress => serializer.serialize_str("in_progress"),
-            Ended => serializer.serialize_str("ended")
+            GameStatus::InLobby => serializer.serialize_str("in_lobby"),
+            GameStatus::Starting => serializer.serialize_str("starting"),
+            GameStatus::InProgress => serializer.serialize_str("in_progress"),
+            GameStatus::Ended => serializer.serialize_str("ended"),
         }
-
     }
 }
 
@@ -38,7 +37,7 @@ pub struct ServerInfo {
     name: String,
     description: String,
     max_clients: usize,
-    clients: Vec<Client>,
+    clients: Vec<ClientInfo>,
     status: GameStatus,
     map: Map,
 }
