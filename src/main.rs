@@ -69,7 +69,6 @@ struct HTTPResponse {
 }
 
 fn update_client(state: &RwLock<ServerState>, client_obj: Client) {
-    
     for i in 0..100 {
         let mut mstate = match state.write() {
             Ok(s) => s,
@@ -85,13 +84,23 @@ fn update_client(state: &RwLock<ServerState>, client_obj: Client) {
     }
 }
 
-/**
- * Process an http request.
- *
- * Returns a response to be sent.
- * We consume the http request string, watch out for this.
- */
-fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse {
+/// Represents what was found in the http request
+struct HTTPRequestInfo {
+    // General headers
+    url: String,
+    method: String,
+    format: Option<String>,
+    auth: Option<String>,
+    length: Option<usize>,
+
+    // Body
+    body: Option<String>,
+
+    // Specific headers for the game server
+    player_code: Option<String>,
+}
+
+fn parse_http_request(s: String) -> Option<HTTPRequestInfo> {
     let mut request_url: Option<(String, String)> = None;
     let url_regex = Regex::new(r"^([A-Z]*)\s(.*)\sHTTP/(\d\.\d)").unwrap();
 
@@ -110,7 +119,6 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
     let mut body = None;
 
     for line in s.split("\n") {
-
         // An empty line means that the next line is the body
         if line == "\r" || line == "" {
             body = Some("".to_string());
@@ -123,7 +131,6 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
             new_s.push_str(&sline);
             body = Some(new_s);
         } else {
-
             // Check if this line has some kind of request url
             if request_url.is_none() {
                 if let Some(caps) = url_regex.captures(line) {
@@ -137,10 +144,7 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
                     );
 
                     if version != "1.0" && version != "1.1" {
-                        return HTTPResponse {
-                            result: create_http_response(505, vec![]),
-                            keep_alive: false,
-                        };
+                        return None
                     }
 
                     request_url = Some((method, url))
@@ -185,7 +189,6 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
                 }
             }
 
-
             // Check for the content length
             //
             // Useful only if we have a body
@@ -193,91 +196,117 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
                 if let Some(caps) = length_regex.captures(line) {
                     length_format = match caps.get(1).unwrap().as_str().parse() {
                         Ok(v) => Some(v),
-                        Err(_) => None
+                        Err(_) => None,
                     }
                 }
             }
         }
     }
 
-    if request_url.is_none() {
-        return HTTPResponse {
-            result: create_http_response(400, vec![]),
-            keep_alive: false,
-        };
+    match request_url {
+        None => None,
+        Some((method, url)) => Some(HTTPRequestInfo {
+            url,
+            method,
+            format: request_format,
+            auth: auth_format,
+            length: length_format,
+            body: body,
+            player_code: code_format,
+        }),
     }
+}
 
-    if request_format.is_none() {
+/**
+ * Process an http request.
+ *
+ * Returns a response to be sent.
+ * We consume the http request string, watch out for this.
+ */
+fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse {
+    let request = match parse_http_request(s) {
+        Some(s) => s,
+        None => {
+            return HTTPResponse {
+                result: create_http_response(400, vec![]),
+                keep_alive: false,
+            };
+        }
+    };
+
+    if request.format.is_none() {
         return HTTPResponse {
             result: create_http_response(415, vec![]),
             keep_alive: false,
         };
     }
 
-    let (method, url) = request_url.unwrap();
-    if code_format.is_none() {
-        if url == "/login" {
-            match body {
-                Some(s) => {
+    match request.player_code {
+        None => {
+            if request.url == "/login".to_string() {
+                match request.body {
+                    Some(s) => {
+                        #[derive(Serialize, Deserialize)]
+                        struct ClientLoginRequest {
+                            client_name: String,
+                        };
 
-                    #[derive(Serialize, Deserialize)]
-                    struct ClientLoginRequest {
-                        client_name: String
-                    };
+                        #[derive(Serialize, Deserialize)]
+                        struct ClientLoginResponse {
+                            id: usize,
+                            code: String,
+                            name: String,
+                        };
 
-                    #[derive(Serialize, Deserialize)]
-                    struct ClientLoginResponse {
-                        id: usize,
-                        code: String,
-                        name: String,
-                    };
+                        let request_body = s.trim().trim_matches(char::from(0));
 
-
-                    let request_body = s.trim().trim_matches(char::from(0));
-
-                    let client_req: ClientLoginRequest = match serde_json::from_str(request_body) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            return HTTPResponse {
-                                result: create_http_response(400, vec![]),
-                                keep_alive: false,
+                        let client_req: ClientLoginRequest =
+                            match serde_json::from_str(request_body) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    return HTTPResponse {
+                                        result: create_http_response(400, vec![]),
+                                        keep_alive: false,
+                                    };
+                                }
                             };
-                        }
-                    };
 
-                    let client_obj = Client::new(&client_req.client_name);
-                    let client_res = ClientLoginResponse {
-                        id: client_obj.id(),
-                        code: client_obj.code(),
-                        name: client_obj.name().to_string(),
-                    };
+                        let client_obj = Client::new(&client_req.client_name);
+                        let client_res = ClientLoginResponse {
+                            id: client_obj.id(),
+                            code: client_obj.code(),
+                            name: client_obj.name().to_string(),
+                        };
 
-                    let client_res_str = serde_json::to_string(&client_res).unwrap();
+                        let client_res_str = serde_json::to_string(&client_res).unwrap();
 
-                    let mut result = create_http_response(200, vec![
-                        format!("Content-Length: {}", client_res_str.len())
-                    ]);
+                        let mut result = create_http_response(
+                            200,
+                            vec![format!("Content-Length: {}", client_res_str.len())],
+                        );
 
-                    result.push_str(&client_res_str);
-                    update_client(&state, client_obj);
+                        result.push_str(&client_res_str);
+                        update_client(&state, client_obj);
 
-                    println!("{:?}", state.read().unwrap().clients);
+                        println!("{:?}", state.read().unwrap().clients);
 
-                    return HTTPResponse {
-                        result,
-                        keep_alive: false,
-                    };
-                }
-                None => {
-                    let mut result = create_http_response(401, vec![]);
-                    result.push_str("{\"error\": \"No body in login request\"}");
-                    return HTTPResponse {
-                        result,
-                        keep_alive: false,
-                    };
+                        return HTTPResponse {
+                            result,
+                            keep_alive: false,
+                        };
+                    }
+                    None => {
+                        let mut result = create_http_response(401, vec![]);
+                        result.push_str("{\"error\": \"No body in login request\"}");
+                        return HTTPResponse {
+                            result,
+                            keep_alive: false,
+                        };
+                    }
                 }
             }
         }
+        Some(code) => panic!("code: {}", code),
     }
 
     return HTTPResponse {
@@ -329,7 +358,6 @@ async fn process_client(state: &'static RwLock<ServerState>, conn: Result<TcpStr
                             if !response.keep_alive {
                                 break;
                             }
-
                         }
                         Err(err) => eprintln!("error on read: {:?}", err),
                     }
@@ -348,26 +376,21 @@ async fn process_client(state: &'static RwLock<ServerState>, conn: Result<TcpStr
     }
 }
 
-
 lazy_static! {
     static ref gstate: RwLock<ServerState> = RwLock::new(ServerState {
         info: ServerInfo::new("Test Server", "Test server description, not in C++", 4),
         clients: vec![],
     });
-
-
 }
 
 #[tokio::main]
 async fn main() {
     let addr = "127.0.0.1:6142";
     let mut listener = TcpListener::bind(addr).await.unwrap();
-	
 
     // Here we convert the `TcpListener` to a stream of incoming connections
     // with the `incoming` method.
     let server = async move {
-    
         let mut incoming = listener.incoming();
         while let Some(conn) = incoming.next().await {
             process_client(&gstate, conn).await;

@@ -1,12 +1,10 @@
 use rand::Rng;
 
 use crate::server::ServerInfo;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use serde::{Deserialize, Serialize, Serializer};
-
-
 
 /// The current state of the client
 ///
