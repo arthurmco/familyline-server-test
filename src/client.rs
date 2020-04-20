@@ -4,10 +4,14 @@ use crate::server::ServerInfo;
 use serde_json::Value;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use serde::{Deserialize, Serialize, Serializer};
+
+
 
 /// The current state of the client
 ///
 /// The client is the player, basically
+#[derive(Debug)]
 pub struct Client {
     id: usize,
     code_seed: usize,
@@ -67,9 +71,17 @@ impl Client {
         format!(
             "{}-{}-{}",
             self.name,
-            self.id * self.name.len(),
+            self.name.len() as u64,
             self.code_seed
         )
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Call when the client first connect, in the /login endpoint

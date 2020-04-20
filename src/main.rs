@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate lazy_static;
+
 use chrono::prelude::*;
 use futures::stream::StreamExt;
 use regex::Regex;
@@ -5,12 +8,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 
 use std::io::Error;
-use std::sync::Arc;
+use std::sync::RwLock;
 
 mod client;
 mod server;
 use client::{Client, ClientError};
 use server::ServerInfo;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 struct ServerState {
     info: ServerInfo,
@@ -62,13 +68,30 @@ struct HTTPResponse {
     keep_alive: bool,
 }
 
+fn update_client(state: &RwLock<ServerState>, client_obj: Client) {
+    
+    for i in 0..100 {
+        let mut mstate = match state.write() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("cannot acquire server state write lock");
+                std::thread::sleep(std::time::Duration::from_millis(i * 40));
+                continue;
+            }
+        };
+
+        mstate.clients.push(client_obj);
+        break;
+    }
+}
+
 /**
  * Process an http request.
  *
  * Returns a response to be sent.
  * We consume the http request string, watch out for this.
  */
-fn process_http_request(state: Arc<ServerState>, s: String) -> HTTPResponse {
+fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse {
     let mut request_url: Option<(String, String)> = None;
     let url_regex = Regex::new(r"^([A-Z]*)\s(.*)\sHTTP/(\d\.\d)").unwrap();
 
@@ -87,7 +110,6 @@ fn process_http_request(state: Arc<ServerState>, s: String) -> HTTPResponse {
     let mut body = None;
 
     for line in s.split("\n") {
-        println!("recv: {:?}", line);
 
         // An empty line means that the next line is the body
         if line == "\r" || line == "" {
@@ -99,7 +121,6 @@ fn process_http_request(state: Arc<ServerState>, s: String) -> HTTPResponse {
             let mut new_s = s.clone();
             let sline = format!("{}\n", line);
             new_s.push_str(&sline);
-            println!(". '{:?}' {}", line, new_s.len());
             body = Some(new_s);
         } else {
 
@@ -185,7 +206,7 @@ fn process_http_request(state: Arc<ServerState>, s: String) -> HTTPResponse {
             keep_alive: false,
         };
     }
-    
+
     if request_format.is_none() {
         return HTTPResponse {
             result: create_http_response(415, vec![]),
@@ -198,12 +219,50 @@ fn process_http_request(state: Arc<ServerState>, s: String) -> HTTPResponse {
         if url == "/login" {
             match body {
                 Some(s) => {
-                    let body_result = s.trim().trim_matches(char::from(0));
+
+                    #[derive(Serialize, Deserialize)]
+                    struct ClientLoginRequest {
+                        client_name: String
+                    };
+
+                    #[derive(Serialize, Deserialize)]
+                    struct ClientLoginResponse {
+                        id: usize,
+                        code: String,
+                        name: String,
+                    };
+
+
+                    let request_body = s.trim().trim_matches(char::from(0));
+
+                    let client_req: ClientLoginRequest = match serde_json::from_str(request_body) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return HTTPResponse {
+                                result: create_http_response(400, vec![]),
+                                keep_alive: false,
+                            };
+                        }
+                    };
+
+                    let client_obj = Client::new(&client_req.client_name);
+                    let client_res = ClientLoginResponse {
+                        id: client_obj.id(),
+                        code: client_obj.code(),
+                        name: client_obj.name().to_string(),
+                    };
+
+                    let client_res_str = serde_json::to_string(&client_res).unwrap();
+
                     let mut result = create_http_response(200, vec![
-                        format!("Content-Length: {}", body_result.len())
+                        format!("Content-Length: {}", client_res_str.len())
                     ]);
 
-                    result.push_str(&body_result);
+                    result.push_str(&client_res_str);
+                    update_client(&state, client_obj);
+
+                    println!("{:?}", state.read().unwrap().clients);
+
                     return HTTPResponse {
                         result,
                         keep_alive: false,
@@ -227,7 +286,7 @@ fn process_http_request(state: Arc<ServerState>, s: String) -> HTTPResponse {
     };
 }
 
-async fn process_client(state: Arc<ServerState>, conn: Result<TcpStream, Error>) {
+async fn process_client(state: &'static RwLock<ServerState>, conn: Result<TcpStream, Error>) {
     match conn {
         Err(e) => eprintln!("accept failed = {:?}", e),
         Ok(mut sock) => {
@@ -259,8 +318,7 @@ async fn process_client(state: Arc<ServerState>, conn: Result<TcpStream, Error>)
                             };
 
                             // Remember that http messages ends with two \r\n
-
-                            let response = process_http_request(state.clone(), s);
+                            let response = process_http_request(&state, s);
                             println!("{}", response.result);
 
                             match writer.write(&response.result.into_bytes()).await {
@@ -271,6 +329,7 @@ async fn process_client(state: Arc<ServerState>, conn: Result<TcpStream, Error>)
                             if !response.keep_alive {
                                 break;
                             }
+
                         }
                         Err(err) => eprintln!("error on read: {:?}", err),
                     }
@@ -289,22 +348,29 @@ async fn process_client(state: Arc<ServerState>, conn: Result<TcpStream, Error>)
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let addr = "127.0.0.1:6142";
-    let mut listener = TcpListener::bind(addr).await.unwrap();
 
-    let state = Arc::new(ServerState {
+lazy_static! {
+    static ref gstate: RwLock<ServerState> = RwLock::new(ServerState {
         info: ServerInfo::new("Test Server", "Test server description, not in C++", 4),
         clients: vec![],
     });
 
+
+}
+
+#[tokio::main]
+async fn main() {
+    let addr = "127.0.0.1:6142";
+    let mut listener = TcpListener::bind(addr).await.unwrap();
+	
+
     // Here we convert the `TcpListener` to a stream of incoming connections
     // with the `incoming` method.
     let server = async move {
+    
         let mut incoming = listener.incoming();
         while let Some(conn) = incoming.next().await {
-            process_client(state.clone(), conn).await;
+            process_client(&gstate, conn).await;
         }
     };
 
