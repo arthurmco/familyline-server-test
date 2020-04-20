@@ -12,7 +12,7 @@ use std::sync::RwLock;
 
 mod client;
 mod server;
-use client::{Client, ClientError};
+use client::{Client, ClientError, ClientResponse};
 use server::ServerInfo;
 
 use serde::{Deserialize, Serialize};
@@ -144,7 +144,7 @@ fn parse_http_request(s: String) -> Option<HTTPRequestInfo> {
                     );
 
                     if version != "1.0" && version != "1.1" {
-                        return None
+                        return None;
                     }
 
                     request_url = Some((method, url))
@@ -163,7 +163,7 @@ fn parse_http_request(s: String) -> Option<HTTPRequestInfo> {
                         .find(|fmt| fmt.contains("application/json") || fmt.contains("text/html"))
                     {
                         Some(fmt) => {
-                            request_format = Some(fmt.to_string());
+                            request_format = Some(fmt.trim().to_string());
                         }
                         None => {}
                     }
@@ -174,8 +174,8 @@ fn parse_http_request(s: String) -> Option<HTTPRequestInfo> {
             // It is not required, except to download maps.
             if auth_format.is_none() {
                 if let Some(caps) = auth_regex.captures(line) {
-                    let auth_data = caps.get(1).unwrap().as_str().to_string();
-                    auth_format = Some(auth_data)
+                    let auth_data = caps.get(1).unwrap().as_str();
+                    auth_format = Some(auth_data.trim().to_string())
                 }
             }
 
@@ -184,8 +184,8 @@ fn parse_http_request(s: String) -> Option<HTTPRequestInfo> {
             // deny access to all endpoints but the login one
             if code_format.is_none() {
                 if let Some(caps) = code_regex.captures(line) {
-                    let code_data = caps.get(1).unwrap().as_str().to_string();
-                    code_format = Some(code_data)
+                    let code_data = caps.get(1).unwrap().as_str();
+                    code_format = Some(code_data.trim().to_string())
                 }
             }
 
@@ -306,7 +306,58 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
                 }
             }
         }
-        Some(code) => panic!("code: {}", code),
+        Some(code) => {
+            let rstate = match state.read() {
+                Ok(c) => c,
+                Err(_) => {
+                    return HTTPResponse {
+                        result: create_http_response(500, vec![]),
+                        keep_alive: false,
+                    };
+                }
+            };
+
+            let client = rstate.clients.iter().find(|c| c.code() == code);
+
+            match client {
+                Some(c) => match c.handle_url(&request.url, &rstate.info) {
+                    Ok(res) => {
+                        let mut result = create_http_response(200, res.headers);
+                        result.push_str(&res.body);
+                        return HTTPResponse {
+                            result,
+                            keep_alive: false,
+                        };
+                    }
+                    Err(e) => {
+                        return match e {
+                            ClientError::Unauthorized => HTTPResponse {
+                                result: create_http_response(401, vec![]),
+                                keep_alive: false,
+                            },
+                            ClientError::ResourceNotExist => HTTPResponse {
+                                result: create_http_response(404, vec![]),
+                                keep_alive: false,
+                            },
+                            ClientError::ServerFailure => HTTPResponse {
+                                result: create_http_response(500, vec![]),
+                                keep_alive: false,
+                            },
+                            ClientError::UnknownEndpoint => HTTPResponse {
+                                result: create_http_response(404, vec![]),
+                                keep_alive: false,
+                            },
+                        }
+                    }
+                },
+                None => {
+                    return HTTPResponse {
+                        result: create_http_response(403, vec![]),
+                        keep_alive: false,
+                    }
+                }
+            }
+        }
     }
 
     return HTTPResponse {

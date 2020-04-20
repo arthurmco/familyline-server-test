@@ -58,9 +58,9 @@ impl Error for ClientError {
     }
 }
 
-struct ClientResponse {
-    headers: Vec<String>,
-    body: String,
+pub struct ClientResponse {
+    pub headers: Vec<String>,
+    pub body: String,
 }
 
 impl Client {
