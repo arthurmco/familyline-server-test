@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize, Serializer};
 
+// A lightweigt client class, with only the parts that we can
+// send to other clients.
 #[derive(Serialize, Deserialize)]
 pub struct ClientInfo {
-    name: String,
+    pub id: usize,
+    pub name: String,
 }
 
 #[derive(Deserialize)]
@@ -54,5 +57,13 @@ impl ServerInfo {
                 name: String::from("map08"),
             },
         }
+    }
+
+    pub fn update_clients(&mut self, v: Vec<ClientInfo>) {
+        self.clients = v
+    }
+
+    pub fn is_client_list_full(&self) -> bool {
+        self.clients.len() >= self.max_clients
     }
 }

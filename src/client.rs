@@ -1,6 +1,6 @@
 use rand::Rng;
 
-use crate::server::ServerInfo;
+use crate::server::{ClientInfo, ServerInfo};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::error::Error;
@@ -99,7 +99,7 @@ impl Client {
     fn handle_info_endpoint(&self, sinfo: &ServerInfo) -> Result<ClientResponse, ClientError> {
         match serde_json::to_string(&sinfo) {
             Ok(res) => Ok(ClientResponse {
-                headers: vec![],
+                headers: vec![format!("Content-Length: {}", res.len())],
                 body: res,
             }),
             Err(_) => Err(ClientError::ServerFailure),
@@ -148,5 +148,14 @@ impl Client {
         }
 
         return Err(ClientError::UnknownEndpoint);
+    }
+}
+
+impl From<&Client> for ClientInfo {
+    fn from(c: &Client) -> Self {
+        ClientInfo {
+            id: c.id(),
+            name: c.name().to_string(),
+        }
     }
 }

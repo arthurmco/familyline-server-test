@@ -13,7 +13,7 @@ use std::sync::RwLock;
 mod client;
 mod server;
 use client::{Client, ClientError, ClientResponse};
-use server::ServerInfo;
+use server::{ClientInfo, ServerInfo};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,12 +35,14 @@ fn create_http_response(http_code: u32, additional_headers: Vec<String>) -> Stri
     let codestr = match http_code {
         101 => "101 Switching Protocols",
         200 => "200 OK",
+        201 => "201 Created",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
         403 => "403 Forbidden",
         404 => "404 Not Found",
         415 => "415 Unsupported Media Type",
         500 => "500 Internal Server Error",
+        503 => "503 Service Unavailable",
         505 => "505 HTTP Version Not Supported",
         _ => panic!("unknown http error!"),
     };
@@ -80,8 +82,14 @@ fn update_client(state: &RwLock<ServerState>, client_obj: Client) {
         };
 
         mstate.clients.push(client_obj);
+        let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
+        mstate.info.update_clients(client_infos);
         break;
     }
+}
+
+fn is_client_list_full(state: &RwLock<ServerState>) -> bool {
+    state.read().unwrap().info.is_client_list_full()
 }
 
 /// Represents what was found in the http request
@@ -244,6 +252,18 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
     match request.player_code {
         None => {
             if request.url == "/login".to_string() {
+                if is_client_list_full(&state) {
+                    let res = "{\"error\": \"CLIENT_LIST_FULL\", \"description\": \"Cannot log, the client list is full\"}";
+
+                    let mut result =
+                        create_http_response(503, vec![format!("Content-Length: {}", res.len())]);
+                    result.push_str(&res);
+                    return HTTPResponse {
+                        result,
+                        keep_alive: false,
+                    };
+                }
+
                 match request.body {
                     Some(s) => {
                         #[derive(Serialize, Deserialize)]
@@ -281,7 +301,7 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
                         let client_res_str = serde_json::to_string(&client_res).unwrap();
 
                         let mut result = create_http_response(
-                            200,
+                            201,
                             vec![format!("Content-Length: {}", client_res_str.len())],
                         );
 
