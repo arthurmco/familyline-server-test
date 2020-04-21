@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 
 use std::io::Error;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 mod client;
 mod server;
@@ -70,9 +70,11 @@ struct HTTPResponse {
     keep_alive: bool,
 }
 
-fn update_client(state: &RwLock<ServerState>, client_obj: Client) {
+fn update_client(state: Arc<RwLock<ServerState>>, client_obj: Client) {
+    println!("locks: {}", Arc::strong_count(&state));
+    let cstate = Arc::clone(&state);
     for i in 0..100 {
-        let mut mstate = match state.write() {
+        let mut mstate = match cstate.write() {
             Ok(s) => s,
             Err(_) => {
                 eprintln!("cannot acquire server state write lock");
@@ -82,6 +84,26 @@ fn update_client(state: &RwLock<ServerState>, client_obj: Client) {
         };
 
         mstate.clients.push(client_obj);
+        let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
+        mstate.info.update_clients(client_infos);
+        break;
+    }
+}
+
+fn remove_client(state: Arc<RwLock<ServerState>>, id: usize) {
+    println!("locks: {}", Arc::strong_count(&state));
+    let cstate = Arc::clone(&state);
+    for i in 0..100 {
+        let mut mstate = match cstate.try_write() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("cannot acquire server state write lock");
+                std::thread::sleep(std::time::Duration::from_millis(i * 40));
+                continue;
+            }
+        };
+
+        mstate.clients.retain(|c| c.id() != id);
         let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
         mstate.info.update_clients(client_infos);
         break;
@@ -225,13 +247,86 @@ fn parse_http_request(s: String) -> Option<HTTPRequestInfo> {
     }
 }
 
+fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> HTTPResponse {
+    if is_client_list_full(&state) {
+        let res = "{\"error\": \"CLIENT_LIST_FULL\", \"description\": \"Cannot log, the client list is full\"}";
+
+        let mut result = create_http_response(503, vec![format!("Content-Length: {}", res.len())]);
+        result.push_str(&res);
+        return HTTPResponse {
+            result,
+            keep_alive: false,
+        };
+    }
+
+    match &request.body {
+        Some(s) => {
+            #[derive(Serialize, Deserialize)]
+            struct ClientLoginRequest {
+                client_name: String,
+            };
+
+            #[derive(Serialize, Deserialize)]
+            struct ClientLoginResponse {
+                id: usize,
+                code: String,
+                name: String,
+            };
+
+            let request_body = s.trim().trim_matches(char::from(0));
+
+            let client_req: ClientLoginRequest = match serde_json::from_str(request_body) {
+                Ok(s) => s,
+                Err(_) => {
+                    return HTTPResponse {
+                        result: create_http_response(400, vec![]),
+                        keep_alive: false,
+                    };
+                }
+            };
+
+            let client_obj = Client::new(&client_req.client_name);
+            let client_res = ClientLoginResponse {
+                id: client_obj.id(),
+                code: client_obj.code(),
+                name: client_obj.name().to_string(),
+            };
+
+            let client_res_str = serde_json::to_string(&client_res).unwrap();
+
+            let mut result = create_http_response(
+                201,
+                vec![format!("Content-Length: {}", client_res_str.len())],
+            );
+
+            result.push_str(&client_res_str);
+            update_client(Arc::clone(&state), client_obj);
+
+            println!("{:?}", state.read().unwrap().clients);
+
+            return HTTPResponse {
+                result,
+                keep_alive: false,
+            };
+        }
+        None => {
+            let mut result = create_http_response(401, vec![]);
+            result.push_str("{\"error\": \"No body in login request\"}");
+            return HTTPResponse {
+                result,
+                keep_alive: false,
+            };
+        }
+    }
+}
+
 /**
  * Process an http request.
  *
  * Returns a response to be sent.
  * We consume the http request string, watch out for this.
  */
-fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse {
+fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResponse {
     let request = match parse_http_request(s) {
         Some(s) => s,
         None => {
@@ -252,83 +347,15 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
     match request.player_code {
         None => {
             if request.url == "/login".to_string() {
-                if is_client_list_full(&state) {
-                    let res = "{\"error\": \"CLIENT_LIST_FULL\", \"description\": \"Cannot log, the client list is full\"}";
-
-                    let mut result =
-                        create_http_response(503, vec![format!("Content-Length: {}", res.len())]);
-                    result.push_str(&res);
-                    return HTTPResponse {
-                        result,
-                        keep_alive: false,
-                    };
-                }
-
-                match request.body {
-                    Some(s) => {
-                        #[derive(Serialize, Deserialize)]
-                        struct ClientLoginRequest {
-                            client_name: String,
-                        };
-
-                        #[derive(Serialize, Deserialize)]
-                        struct ClientLoginResponse {
-                            id: usize,
-                            code: String,
-                            name: String,
-                        };
-
-                        let request_body = s.trim().trim_matches(char::from(0));
-
-                        let client_req: ClientLoginRequest =
-                            match serde_json::from_str(request_body) {
-                                Ok(s) => s,
-                                Err(_) => {
-                                    return HTTPResponse {
-                                        result: create_http_response(400, vec![]),
-                                        keep_alive: false,
-                                    };
-                                }
-                            };
-
-                        let client_obj = Client::new(&client_req.client_name);
-                        let client_res = ClientLoginResponse {
-                            id: client_obj.id(),
-                            code: client_obj.code(),
-                            name: client_obj.name().to_string(),
-                        };
-
-                        let client_res_str = serde_json::to_string(&client_res).unwrap();
-
-                        let mut result = create_http_response(
-                            201,
-                            vec![format!("Content-Length: {}", client_res_str.len())],
-                        );
-
-                        result.push_str(&client_res_str);
-                        update_client(&state, client_obj);
-
-                        println!("{:?}", state.read().unwrap().clients);
-
-                        return HTTPResponse {
-                            result,
-                            keep_alive: false,
-                        };
-                    }
-                    None => {
-                        let mut result = create_http_response(401, vec![]);
-                        result.push_str("{\"error\": \"No body in login request\"}");
-                        return HTTPResponse {
-                            result,
-                            keep_alive: false,
-                        };
-                    }
-                }
+                return handle_login(&state, &request);
             }
         }
         Some(code) => {
-            let rstate = match state.read() {
-                Ok(c) => c,
+            let client_code = match state.read() {
+                Ok(c) => match c.clients.iter().find(|c| c.code() == code) {
+                    Some(s) => Some(s.id()),
+                    None => None,
+                },
                 Err(_) => {
                     return HTTPResponse {
                         result: create_http_response(500, vec![]),
@@ -337,39 +364,59 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
                 }
             };
 
-            let client = rstate.clients.iter().find(|c| c.code() == code);
-
-            match client {
-                Some(c) => match c.handle_url(&request.url, &rstate.info) {
-                    Ok(res) => {
-                        let mut result = create_http_response(200, res.headers);
-                        result.push_str(&res.body);
-                        return HTTPResponse {
-                            result,
-                            keep_alive: false,
-                        };
-                    }
-                    Err(e) => {
-                        return match e {
-                            ClientError::Unauthorized => HTTPResponse {
-                                result: create_http_response(401, vec![]),
-                                keep_alive: false,
-                            },
-                            ClientError::ResourceNotExist => HTTPResponse {
-                                result: create_http_response(404, vec![]),
-                                keep_alive: false,
-                            },
-                            ClientError::ServerFailure => HTTPResponse {
+            match client_code {
+                Some(cid) if request.url.starts_with("/logout") => {
+                    eprintln!("removing client id {}", cid);
+                    remove_client(Arc::clone(&state), cid);
+                    return HTTPResponse {
+                        result: create_http_response(200, vec![]),
+                        keep_alive: false,
+                    };
+                }
+                Some(cid) => {
+                    let rstate = match state.read() {
+                        Ok(c) => c,
+                        Err(_) => {
+                            return HTTPResponse {
                                 result: create_http_response(500, vec![]),
                                 keep_alive: false,
-                            },
-                            ClientError::UnknownEndpoint => HTTPResponse {
-                                result: create_http_response(404, vec![]),
+                            };
+                        }
+                    };
+
+                    let c = rstate.clients.iter().find(|c| c.id() == cid).unwrap();
+                    
+                    match c.handle_url(&request.url, &rstate.info) {
+                        Ok(res) => {
+                            let mut result = create_http_response(200, res.headers);
+                            result.push_str(&res.body);
+                            return HTTPResponse {
+                                result,
                                 keep_alive: false,
-                            },
+                            };
+                        }
+                        Err(e) => {
+                            return match e {
+                                ClientError::Unauthorized => HTTPResponse {
+                                    result: create_http_response(401, vec![]),
+                                    keep_alive: false,
+                                },
+                                ClientError::ResourceNotExist => HTTPResponse {
+                                    result: create_http_response(404, vec![]),
+                                    keep_alive: false,
+                                },
+                                ClientError::ServerFailure => HTTPResponse {
+                                    result: create_http_response(500, vec![]),
+                                    keep_alive: false,
+                                },
+                                ClientError::UnknownEndpoint => HTTPResponse {
+                                    result: create_http_response(404, vec![]),
+                                    keep_alive: false,
+                                },
+                            }
                         }
                     }
-                },
+                }
                 None => {
                     return HTTPResponse {
                         result: create_http_response(403, vec![]),
@@ -386,7 +433,7 @@ fn process_http_request(state: &RwLock<ServerState>, s: String) -> HTTPResponse 
     };
 }
 
-async fn process_client(state: &'static RwLock<ServerState>, conn: Result<TcpStream, Error>) {
+async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<TcpStream, Error>) {
     match conn {
         Err(e) => eprintln!("accept failed = {:?}", e),
         Ok(mut sock) => {
@@ -397,6 +444,8 @@ async fn process_client(state: &'static RwLock<ServerState>, conn: Result<TcpStr
             tokio::spawn(async move {
                 // Split up the reading and writing parts of the
                 // socket.
+                let cstate = Arc::clone(&state);
+
                 let (mut reader, mut writer) = sock.split();
 
                 loop {
@@ -418,7 +467,7 @@ async fn process_client(state: &'static RwLock<ServerState>, conn: Result<TcpStr
                             };
 
                             // Remember that http messages ends with two \r\n
-                            let response = process_http_request(&state, s);
+                            let response = process_http_request(&cstate, s);
                             println!("{}", response.result);
 
                             match writer.write(&response.result.into_bytes()).await {
@@ -448,10 +497,10 @@ async fn process_client(state: &'static RwLock<ServerState>, conn: Result<TcpStr
 }
 
 lazy_static! {
-    static ref gstate: RwLock<ServerState> = RwLock::new(ServerState {
+    static ref gstate: Arc<RwLock<ServerState>> = Arc::new(RwLock::new(ServerState {
         info: ServerInfo::new("Test Server", "Test server description, not in C++", 4),
         clients: vec![],
-    });
+    }));
 }
 
 #[tokio::main]
