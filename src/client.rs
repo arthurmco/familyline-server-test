@@ -173,7 +173,7 @@ impl Client {
         if url.starts_with("/maps") {
             return match url.splitn(3, '/').nth(2) {
                 Some(map) => self.handle_map_endpoint(&map),
-                None => self.handle_map_list_endpoint()
+                None => self.handle_map_list_endpoint(),
             };
         }
 

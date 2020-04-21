@@ -4,10 +4,11 @@ extern crate lazy_static;
 use chrono::prelude::*;
 use futures::stream::StreamExt;
 use regex::Regex;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::prelude::*;
 
 use std::io::Error;
+use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 
 mod client;
@@ -503,11 +504,53 @@ lazy_static! {
     }));
 }
 
+// Parse a discover message, return a response to it
+fn parse_discover_message(s: String) -> Option<String> {
+    enum DiscoverOperation {
+        Search,
+    };
+
+    let mut op: Option<DiscoverOperation> = None;
+    let mut valid_servicetype = false;
+    let mut valid_method = false;
+
+    for line in s.split("\r\n") {
+        println!("> {}", line);
+
+        if line.starts_with("M-SEARCH *") {
+            op = Some(DiscoverOperation::Search);
+        }
+
+        if line == "MAN: \"ssdp:discover\"" {
+            valid_method = true;
+        }
+
+        // Respond to ssdp:all too?
+        if line == "ST: game_server:familyline1" {
+            valid_servicetype = true;
+        }
+
+        // Message ended.
+        if line.trim() == "" {
+            break;
+        }
+    }
+
+    if !valid_servicetype || !valid_method {
+        return None;
+    }
+
+    println!(" -- response is valid --");
+
+    return Some("AAAA".to_string());
+}
+
 #[tokio::main]
 async fn main() {
     let addr = "127.0.0.1:6142";
     let mut listener = TcpListener::bind(addr).await.unwrap();
 
+    // The main loop for the HTTP part of the protocol
     // Here we convert the `TcpListener` to a stream of incoming connections
     // with the `incoming` method.
     let server = async move {
@@ -518,6 +561,46 @@ async fn main() {
     };
 
     println!("Server running on localhost:6142");
+
+    // Add a socket that will be used by clients so they can discover
+    // the server. We use UDP so we can simply multicast a search message
+    // and then the server will receive it and send the appropriate info
+    // to the client.
+    // We will use a VERY limited subset of SSDP, basically just the
+    // M-SEARCH message. For this reason, we bind the server to another
+    // port.
+    let mut udp_discover = UdpSocket::bind("0.0.0.0:1983").await.unwrap();
+    tokio::spawn(async move {
+        udp_discover
+            .join_multicast_v4(
+                "239.255.255.250".parse().unwrap(),
+                "0.0.0.0".parse().unwrap(),
+            )
+            .unwrap();
+        println!("Server is discoverable");
+        loop {
+            let mut buf = vec![0; 1024];
+            match udp_discover.recv_from(&mut buf).await {
+                Ok((msize, sockaddr)) => {
+                    let msg = match String::from_utf8(buf) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            format!("{:?} ({:?})", e.as_bytes(), e.utf8_error());
+                            "".to_string()
+                        }
+                    };
+
+                    let res = parse_discover_message(msg);
+                    if let Some(response) = res {
+                        println!("{}", response);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("An error happened while receiving a message on the listen socket")
+                }
+            }
+        }
+    });
 
     // Start the server and block this async fn until `server` spins down.
     server.await;
