@@ -117,7 +117,7 @@ impl Client {
     }
 
     fn handle_map_endpoint(&self, map: &str) -> Result<ClientResponse, ClientError> {
-        if map == "08" {
+        if map == "test01.fmap" {
             return Ok(ClientResponse {
                 headers: vec![
                     "Content-Length: 30".to_string(),
@@ -127,6 +127,36 @@ impl Client {
             });
         } else {
             return Err(ClientError::Unauthorized);
+        }
+    }
+
+    fn handle_map_list_endpoint(&self) -> Result<ClientResponse, ClientError> {
+        #[derive(Serialize, Deserialize)]
+        struct MapFile {
+            name: String,
+            hash: String,
+            filename: String,
+        }
+
+        let map_list = vec![
+            MapFile {
+                name: "test01".to_string(),
+                hash: "1234567890".to_string(),
+                filename: "test01.fmap".to_string(),
+            },
+            MapFile {
+                name: "test02".to_string(),
+                hash: "2234567891".to_string(),
+                filename: "test02.fmap".to_string(),
+            },
+        ];
+
+        match serde_json::to_string(&map_list) {
+            Ok(res) => Ok(ClientResponse {
+                headers: vec![format!("Content-Length: {}", res.len())],
+                body: res,
+            }),
+            Err(_) => Err(ClientError::ServerFailure),
         }
     }
 
@@ -140,10 +170,10 @@ impl Client {
             return self.handle_connect_endpoint();
         }
 
-        if url.starts_with("/map/") {
+        if url.starts_with("/maps") {
             return match url.splitn(3, '/').nth(2) {
                 Some(map) => self.handle_map_endpoint(&map),
-                None => Err(ClientError::UnknownEndpoint),
+                None => self.handle_map_list_endpoint()
             };
         }
 

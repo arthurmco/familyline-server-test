@@ -385,7 +385,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                     };
 
                     let c = rstate.clients.iter().find(|c| c.id() == cid).unwrap();
-                    
+
                     match c.handle_url(&request.url, &rstate.info) {
                         Ok(res) => {
                             let mut result = create_http_response(200, res.headers);
