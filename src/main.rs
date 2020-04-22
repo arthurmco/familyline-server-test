@@ -8,13 +8,13 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::prelude::*;
 
 use std::io::Error;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 mod client;
 mod server;
 use client::{Client, ClientError, ClientResponse};
-use server::{ClientInfo, ServerInfo};
+use server::{ClientInfo, ServerDiscoveryInfo, ServerInfo};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -352,6 +352,12 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
             }
         }
         Some(code) => {
+            // Read the client code first
+            // Since we cannot held a read lock while writing, and we
+            // write to the state variable in some of the endpoints,
+            // we get the client ID, so that we can always find the
+            // client, and we do not need to store the client object
+            // all times.
             let client_code = match state.read() {
                 Ok(c) => match c.clients.iter().find(|c| c.code() == code) {
                     Some(s) => Some(s.id()),
@@ -499,9 +505,46 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
 
 lazy_static! {
     static ref gstate: Arc<RwLock<ServerState>> = Arc::new(RwLock::new(ServerState {
-        info: ServerInfo::new("Test Server", "Test server description, not in C++", 4),
+        info: ServerInfo::new("Test Server", "Server written in Rust, not in C++", 4),
         clients: vec![],
     }));
+}
+
+use pnet::datalink;
+use vecfold::VecFoldResult;
+
+/// Find local IPv4 address
+/// No IPv6 support yet because I am pretty sure my router is shit
+/// and will not work well with it.
+/// (this is also the reason why I set up only an ipv4 multicast)
+///
+/// Used primarily for the discover message response we receive in
+/// multicast to tell the client where to connect to
+///
+/// If no address is found, it falls back to the loopback address.
+fn find_local_address() -> String {
+    for iface in datalink::interfaces()
+        .iter()
+        .filter(|i| i.ips.len() > 0)
+        .filter(|i| {
+            if let Some(mac) = i.mac {
+                !mac.is_zero()
+            } else {
+                false
+            }
+        })
+    {
+        let ips = &iface.ips;
+        return ips
+            .iter()
+            .filter(|i| i.ip().is_ipv4())
+            .map(|i| i.ip().to_string())
+            .nth(0)
+            .or_else(|| Some(String::from("127.0.0.1")))
+            .unwrap();
+    }
+
+    return String::from("127.0.0.1");
 }
 
 // Parse a discover message, return a response to it
@@ -540,14 +583,52 @@ fn parse_discover_message(s: String) -> Option<String> {
         return None;
     }
 
+    let sinfo = ServerDiscoveryInfo::from(&gstate.read().unwrap().info);
+    let sinfo_str = serde_json::to_string(&sinfo).unwrap();
+
+    let now: DateTime<Utc> = Utc::now();
+    let response_lines = vec![
+        String::from("HTTP/1.1 200 OK"),
+        String::from("Cache-Control: max-age=60"),
+        format!("Date: {}", format_rfc2616_date(now)),
+        String::from("Ext: "),
+        format!("Location: http://{}:6142", find_local_address()),
+        format!("Content-Length: {}", sinfo_str.len()),
+        String::from("Server: familyline-server 0.0.1-test"),
+        String::from(""),
+        sinfo_str,
+    ];
+
     println!(" -- response is valid --");
 
-    return Some("AAAA".to_string());
+    return Some(response_lines.join("\r\n"));
+}
+
+/// Since UDP is unreliable, we might need to send the response
+/// packet more than once, because it will not give an error even
+/// if the packet did not reach its destination.
+async fn send_multiple(
+    socket: &mut UdpSocket,
+    addr: &SocketAddr,
+    buf: String,
+    count: usize,
+) -> Result<usize, std::io::Error> {
+    let data = buf.as_bytes();
+    let mut v = vec![];
+
+    for _i in 0..count {
+        v.push(socket.send_to(&data, addr).await);
+    }
+
+    match v.foldr() {
+        Ok(sizes) => Ok(**sizes.iter().max().unwrap()),
+        Err(e) => Err(std::io::Error::from_raw_os_error(e.raw_os_error().unwrap())),
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let addr = "127.0.0.1:6142";
+    let addr = "0.0.0.0:6142";
     let mut listener = TcpListener::bind(addr).await.unwrap();
 
     // The main loop for the HTTP part of the protocol
@@ -560,6 +641,7 @@ async fn main() {
         }
     };
 
+    println!("Server address is {}", find_local_address());
     println!("Server running on localhost:6142");
 
     // Add a socket that will be used by clients so they can discover
@@ -592,7 +674,15 @@ async fn main() {
 
                     let res = parse_discover_message(msg);
                     if let Some(response) = res {
-                        println!("{}", response);
+                        match send_multiple(&mut udp_discover, &sockaddr, response.clone(), 5).await
+                        {
+                            Ok(ssize) => {
+                                println!("{:?}, {} bytes\n V \n{}", sockaddr, ssize, response);
+                            }
+                            Err(e) => {
+                                eprintln!("{:?}", e);
+                            }
+                        }
                     }
                 }
                 Err(_) => {

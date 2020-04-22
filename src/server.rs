@@ -8,7 +8,7 @@ pub struct ClientInfo {
     pub name: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Copy, Clone, Deserialize)]
 pub enum GameStatus {
     InLobby,
     Starting,
@@ -38,17 +38,47 @@ pub struct Map {
 #[derive(Serialize, Deserialize)]
 pub struct ServerInfo {
     name: String,
+    version: String,
     description: String,
     max_clients: usize,
     clients: Vec<ClientInfo>,
     status: GameStatus,
+
     map: Map,
+}
+
+/// A structure that serves only to be deserialized and shown in the
+/// discovery message response.
+/// It contains many fields that we already have in ServerInfo, but
+/// hides some others, and for that reason alone I created this struct
+#[derive(Serialize, Deserialize)]
+pub struct ServerDiscoveryInfo {
+    name: String,
+    version: String,
+    description: String,
+    client_count: usize,
+    max_clients: usize,
+    status: GameStatus,
+}
+
+impl From<&ServerInfo> for ServerDiscoveryInfo {
+    fn from(s: &ServerInfo) -> Self {
+        ServerDiscoveryInfo {
+            name: s.name.clone(),
+            version: s.version.clone(),
+            description: s.description.clone(),
+            client_count: s.clients.len(),
+            max_clients: s.max_clients,
+            status: s.status,
+        }
+    }
 }
 
 impl ServerInfo {
     pub fn new(name: &str, description: &str, max_clients: usize) -> ServerInfo {
         ServerInfo {
             name: String::from(name),
+            version: String::from("0.1.99"),
             description: String::from(description),
             max_clients,
             clients: vec![],
