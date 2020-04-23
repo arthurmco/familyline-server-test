@@ -7,9 +7,9 @@ developing.
 
 Also a way for me to learn Rust.
 
-This code is not too good, but I will probably clean it.
+This code is not too good, but I will probably make it clearer.
 
-Also, no test suite. My [other Rust experimental
+Also, no test suite yet. My [other Rust experimental
 program](https://gist.github.com/arthurmco/92ab10eb55cbc332132010bb5b46502a)
 has some.
 
@@ -34,7 +34,7 @@ Currently, I have only:
 The in-game protocol, that the game will use to send his inputs and
 receive other players' input, send and receive chat data,
 synchronization packets and verification packets, is not
-implemented. Not a single bit of that.  
+implemented. Not a single bit *yet*.  
 But I plan to use something like Protocol Buffers or FlatBuffers to
 encode it. They need you to define  a schema, and they encode the data
 in a more or less common format. The schema definition will of course
