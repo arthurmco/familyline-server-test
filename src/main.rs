@@ -674,7 +674,7 @@ async fn main() {
 
                     let res = parse_discover_message(msg);
                     if let Some(response) = res {
-                        match send_multiple(&mut udp_discover, &sockaddr, response.clone(), 5).await
+                        match send_multiple(&mut udp_discover, &sockaddr, response.clone(), 2).await
                         {
                             Ok(ssize) => {
                                 println!("{:?}, {} bytes\n V \n{}", sockaddr, ssize, response);
