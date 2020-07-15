@@ -15,7 +15,7 @@ mod server;
 mod request;
 use client::{Client, ClientError, ClientResponse};
 use server::{ClientInfo, ServerDiscoveryInfo, ServerInfo};
-use request::{HTTPRequestInfo};
+use request::{HTTPRequestInfo, HTTPResponse};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,64 +24,6 @@ struct ServerState {
     info: ServerInfo,
     clients: Vec<Client>,
     host_password: String
-}
-
-fn format_rfc2616_date(date: DateTime<Utc>) -> String {
-    date.format("%a, %d %b %Y %T GMT").to_string()
-}
-
-/// Creates the http response, only the header
-fn create_http_response(http_code: u32, content: &str, additional_headers: Vec<String>) -> HTTPResponse {
-    let mut lines: Vec<String> = Vec::new();
-    let now: DateTime<Utc> = Utc::now();
-
-    let codestr = match http_code {
-        101 => "101 Switching Protocols",
-        200 => "200 OK",
-        201 => "201 Created",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        404 => "404 Not Found",
-        415 => "415 Unsupported Media Type",
-        500 => "500 Internal Server Error",
-        503 => "503 Service Unavailable",
-        505 => "505 HTTP Version Not Supported",
-        _ => panic!("unknown http error!"),
-    };
-
-    let body = content.to_string();
-
-    lines.push(format!("HTTP/1.1 {}", codestr));
-    lines.push(format!("Date: {}", format_rfc2616_date(now)));
-    lines.push("Cache-Control: private, max-age=0".to_string());
-    lines.push("Server: familyline-server 0.0.1-test".to_string());
-
-    if body.len() > 0 {
-        lines.push(format!("Content-Length: {}", body.len()));
-    }
-
-    if http_code >= 200 && http_code <= 299 {
-        lines.push("Content-Type: application/json".to_string());
-    }
-
-    lines.extend(additional_headers);
-
-    lines.push("".to_string());
-    lines.push("".to_string());
-
-    lines.push(body);
-
-    return HTTPResponse {
-        result: lines.join("\r\n"),
-        keep_alive: false,
-    };
-}
-
-struct HTTPResponse {
-    result: String,
-
-    keep_alive: bool,
 }
 
 fn update_client(state: Arc<RwLock<ServerState>>, client_obj: Client) {
@@ -133,7 +75,7 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
     if is_client_list_full(&state) {
         let res = "{\"error\": \"CLIENT_LIST_FULL\", \"description\": \"Cannot log, the client list is full\"}";
 
-        return create_http_response(503, &res, vec![]);
+        return HTTPResponse::new(503, &res, vec![]);
     }
 
     match &request.body {
@@ -155,7 +97,7 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
             let client_req: ClientLoginRequest = match serde_json::from_str(request_body) {
                 Ok(s) => s,
                 Err(_) => {
-                    return create_http_response(
+                    return HTTPResponse::new(
                         400,
                         "",
                         vec![],
@@ -175,14 +117,14 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
 
             println!("{:?}", state.read().unwrap().clients);
 
-            return create_http_response(
+            return HTTPResponse::new(
                 201,
                 &client_res_str,
                 vec![],
             );
         }
         None => {
-            return create_http_response(401, "{\"error\": \"No body in login request\"}", vec![]);
+            return HTTPResponse::new(401, "{\"error\": \"No body in login request\"}", vec![]);
         }
     }
 }
@@ -197,7 +139,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
     let request = match HTTPRequestInfo::parse_http_request(s) {
         Some(s) => s,
         None => {
-            return create_http_response(
+            return HTTPResponse::new(
                 400,
                 "",
                 vec![],
@@ -206,7 +148,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
     };
 
     if request.format.is_none() {
-        return create_http_response(
+        return HTTPResponse::new(
             415,
             "",
             vec![],
@@ -240,7 +182,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                     None => None,
                 },
                 Err(_) => {
-                    return create_http_response(
+                    return HTTPResponse::new(
                         500,
                         "",
                         vec![],
@@ -252,7 +194,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                 Some(cid) if request.url.starts_with("/logout") => {
                     eprintln!("removing client id {}", cid);
                     remove_client(Arc::clone(&state), cid);
-                    return create_http_response(
+                    return HTTPResponse::new(
                         200,
                         "",
                         vec![],
@@ -262,7 +204,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                     let rstate = match state.read() {
                         Ok(c) => c,
                         Err(_) => {
-                            return create_http_response(
+                            return HTTPResponse::new(
                                 500,
                                 "",
                                 vec![],
@@ -274,7 +216,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
 
                     match c.handle_url(&request.url, &rstate.info) {
                         Ok(res) => {
-                            return create_http_response(
+                            return HTTPResponse::new(
                                 200,
                                 &res.body,
                                 res.headers,
@@ -282,20 +224,20 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                         }
                         Err(e) => {
                             return match e {
-                                ClientError::Unauthorized => create_http_response(401, "", vec![]),
-                                ClientError::ResourceNotExist => create_http_response(404, "", vec![]),
-                                ClientError::ServerFailure => create_http_response(500, "", vec![]),
-                                ClientError::UnknownEndpoint => create_http_response(404, "", vec![])
+                                ClientError::Unauthorized => HTTPResponse::new(401, "", vec![]),
+                                ClientError::ResourceNotExist => HTTPResponse::new(404, "", vec![]),
+                                ClientError::ServerFailure => HTTPResponse::new(500, "", vec![]),
+                                ClientError::UnknownEndpoint => HTTPResponse::new(404, "", vec![])
                             }
                         }
                     }
                 }
-                None => return create_http_response(403, "", vec![])
+                None => return HTTPResponse::new(403, "", vec![])
             }
         }
     }
 
-    return create_http_response(404, "", vec![]);
+    return HTTPResponse::new(404, "", vec![]);
 }
 
 async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<TcpStream, Error>) {
@@ -369,99 +311,8 @@ lazy_static! {
     }));
 }
 
-use pnet::datalink;
 use vecfold::VecFoldResult;
 
-/// Find local IPv4 address
-/// No IPv6 support yet because I am pretty sure my router is shit
-/// and will not work well with it.
-/// (this is also the reason why I set up only an ipv4 multicast)
-///
-/// Used primarily for the discover message response we receive in
-/// multicast to tell the client where to connect to
-///
-/// If no address is found, it falls back to the loopback address.
-fn find_local_address() -> String {
-    for iface in datalink::interfaces()
-        .iter()
-        .filter(|i| i.ips.len() > 0)
-        .filter(|i| {
-            if let Some(mac) = i.mac {
-                !mac.is_zero()
-            } else {
-                false
-            }
-        })
-    {
-        let ips = &iface.ips;
-        return ips
-            .iter()
-            .filter(|i| i.ip().is_ipv4())
-            .map(|i| i.ip().to_string())
-            .nth(0)
-            .or_else(|| Some(String::from("127.0.0.1")))
-            .unwrap();
-    }
-
-    return String::from("127.0.0.1");
-}
-
-// Parse a discover message, return a response to it
-fn parse_discover_message(s: String) -> Option<String> {
-    enum DiscoverOperation {
-        Search,
-    };
-
-    let mut op: Option<DiscoverOperation> = None;
-    let mut valid_servicetype = false;
-    let mut valid_method = false;
-
-    for line in s.split("\r\n") {
-        println!("> {}", line);
-
-        if line.starts_with("M-SEARCH *") {
-            op = Some(DiscoverOperation::Search);
-        }
-
-        if line == "MAN: \"ssdp:discover\"" {
-            valid_method = true;
-        }
-
-        // Respond to ssdp:all too?
-        if line == "ST: game_server:familyline1" {
-            valid_servicetype = true;
-        }
-
-        // Message ended.
-        if line.trim() == "" {
-            break;
-        }
-    }
-
-    if !valid_servicetype || !valid_method {
-        return None;
-    }
-
-    let sinfo = ServerDiscoveryInfo::from(&gstate.read().unwrap().info);
-    let sinfo_str = serde_json::to_string(&sinfo).unwrap();
-
-    let now: DateTime<Utc> = Utc::now();
-    let response_lines = vec![
-        String::from("HTTP/1.1 200 OK"),
-        String::from("Cache-Control: max-age=60"),
-        format!("Date: {}", format_rfc2616_date(now)),
-        String::from("Ext: "),
-        format!("Location: http://{}:6142", find_local_address()),
-        format!("Content-Length: {}", sinfo_str.len()),
-        String::from("Server: familyline-server 0.0.1-test"),
-        String::from(""),
-        sinfo_str,
-    ];
-
-    println!(" -- response is valid --");
-
-    return Some(response_lines.join("\r\n"));
-}
 
 /// Since UDP is unreliable, we might need to send the response
 /// packet more than once, because it will not give an error even
@@ -522,7 +373,7 @@ async fn main() {
         }
     };
 
-    println!("Server address is {}", find_local_address());
+    println!("Server address is {}", request::find_local_address());
     println!("Server running on localhost:6142");
 
     // Add a socket that will be used by clients so they can discover
@@ -553,7 +404,8 @@ async fn main() {
                         }
                     };
 
-                    let res = parse_discover_message(msg);
+                    let res = request::parse_discover_message(
+                        msg, &ServerDiscoveryInfo::from(&gstate.read().unwrap().info));
                     if let Some(response) = res {
                         match send_multiple(&mut udp_discover, &sockaddr, response.clone(), 2).await
                         {
