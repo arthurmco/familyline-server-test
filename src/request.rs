@@ -1,8 +1,8 @@
-use regex::Regex;
 use chrono::prelude::*;
 use pnet::datalink;
+use regex::Regex;
 
-use crate::server::{ServerDiscoveryInfo};
+use crate::server::ServerDiscoveryInfo;
 
 /// Represents what was found in the http request
 pub struct HTTPRequestInfo {
@@ -79,10 +79,9 @@ impl HTTPRequestInfo {
                     if let Some(caps) = accept_regex.captures(line) {
                         let accept_formats = caps.get(1).unwrap().as_str();
 
-                        match accept_formats
-                            .split(',')
-                            .find(|fmt| fmt.contains("application/json") || fmt.contains("text/html"))
-                        {
+                        match accept_formats.split(',').find(|fmt| {
+                            fmt.contains("application/json") || fmt.contains("text/html")
+                        }) {
                             Some(fmt) => {
                                 request_format = Some(fmt.trim().to_string());
                             }
@@ -150,7 +149,6 @@ fn format_rfc2616_date(date: DateTime<Utc>) -> String {
 }
 
 impl HTTPResponse {
-    
     /// Creates the http response
     pub fn new(http_code: u32, content: &str, additional_headers: Vec<String>) -> HTTPResponse {
         let mut lines: Vec<String> = Vec::new();
@@ -192,7 +190,6 @@ impl HTTPResponse {
 
         lines.push(body);
 
-
         return HTTPResponse {
             result: lines.join("\r\n"),
             keep_alive: false,
@@ -233,8 +230,6 @@ pub fn find_local_address() -> String {
 
     return String::from("127.0.0.1");
 }
-
-
 
 // Parse a discover message, return a response to it
 pub fn parse_discover_message(s: String, sinfo: &ServerDiscoveryInfo) -> Option<String> {

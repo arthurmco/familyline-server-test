@@ -1,6 +1,6 @@
 use rand::Rng;
 
-use crate::server::{ClientInfo, ServerInfo};
+use crate::server::{ClientInfo, ClientType, ServerInfo};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::error::Error;
@@ -9,7 +9,7 @@ use std::fmt::{Display, Formatter};
 /// The current state of the client
 ///
 /// The client is the player, basically
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
     id: usize,
     code_seed: usize,
@@ -19,11 +19,16 @@ pub struct Client {
     /// If true, the client is also connected to the native game
     /// protocol. Usually means that the match already begun
     connected_native: bool,
+
+    ctype: ClientType,
 }
 
 /// A client error
 #[derive(Debug, Clone)]
 pub enum ClientError {
+    /// The input the user gave was incorrect
+    BadInput,
+
     /// The client has no authorization to perform this action
     /// for example, downloading a map, or entering a password
     /// protected server
@@ -82,6 +87,14 @@ impl Client {
         &self.name
     }
 
+    pub fn get_client_type(&self) -> ClientType {
+        self.ctype
+    }
+
+    pub fn set_client_type(&mut self, c: ClientType) {
+        self.ctype = c;
+    }
+
     /// Call when the client first connect, in the /login endpoint
     ///
     ///
@@ -93,36 +106,74 @@ impl Client {
             code_seed: rng.gen(),
             name: String::from(name),
             connected_native: false,
+            ctype: ClientType::Normal,
         }
     }
 
     fn handle_info_endpoint(&self, sinfo: &ServerInfo) -> Result<ClientResponse, ClientError> {
         match serde_json::to_string(&sinfo) {
             Ok(res) => Ok(ClientResponse {
-                headers: vec![format!("Content-Length: {}", res.len())],
+                headers: vec![],
                 body: res,
             }),
             Err(_) => Err(ClientError::ServerFailure),
         }
     }
 
-    fn handle_connect_endpoint(&self) -> Result<ClientResponse, ClientError> {
+    fn handle_ready_endpoint(&self) -> Result<ClientResponse, ClientError> {
         Ok(ClientResponse {
             headers: vec![
                 "Connection: upgrade".to_string(),
                 "Upgrade: familyline-server-protocol/0.0.1".to_string(),
             ],
-            body: "!FL CONNECT localhost 32000\n\n".to_string(),
+            body: "!FL READY localhost 32000\n\n".to_string(),
         })
+    }
+
+    fn handle_host_endpoint(
+        &mut self,
+        sinfo: &ServerInfo,
+        body: &str,
+    ) -> Result<ClientResponse, ClientError> {
+        let sbody = body.chars().filter(|&c| c != '\0').collect::<String>();
+
+        #[derive(Serialize, Deserialize)]
+        struct ClientHostRequest {
+            password: String,
+        };
+
+        // Do not allow setting the host again in this endpoint
+        if sinfo
+            .clients
+            .iter()
+            .filter(|c| c.ctype == ClientType::Moderator)
+            .count()
+            > 0
+        {
+            return Err(ClientError::BadInput);
+        }
+
+        let ahost_req: ClientHostRequest = serde_json::from_str(&sbody).unwrap();
+        let host_req: ClientHostRequest = match serde_json::from_str(&sbody) {
+            Ok(s) => s,
+            Err(_) => return Err(ClientError::BadInput),
+        };
+
+        if sinfo.check_password(&host_req.password) {
+            self.ctype = ClientType::Moderator;
+            return Ok(ClientResponse {
+                headers: vec![],
+                body: String::from(""),
+            });
+        } else {
+            return Err(ClientError::Unauthorized);
+        }
     }
 
     fn handle_map_endpoint(&self, map: &str) -> Result<ClientResponse, ClientError> {
         if map == "test01.fmap" {
             return Ok(ClientResponse {
-                headers: vec![
-                    "Content-Length: 30".to_string(),
-                    "Content-Type: application/octet-stream".to_string(),
-                ],
+                headers: vec!["Content-Type: application/octet-stream".to_string()],
                 body: "FMAPAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             });
         } else {
@@ -160,14 +211,30 @@ impl Client {
         }
     }
 
+    /// Check if a endpoint has a mutable handler
+    pub fn is_url_mutable(&self, url: &str) -> bool {
+        // Please change this when the list gets big.
+
+        if url.starts_with("/setmod") {
+            return true;
+        }
+
+        return false;
+    }
+
     /// Handle the url as called by this client
-    pub fn handle_url(&self, url: &str, sinfo: &ServerInfo) -> Result<ClientResponse, ClientError> {
+    pub fn handle_url(
+        &self,
+        url: &str,
+        sinfo: &ServerInfo,
+        body: &str,
+    ) -> Result<ClientResponse, ClientError> {
         if url == "/info" {
             return self.handle_info_endpoint(&sinfo);
         }
 
-        if url == "/connect" {
-            return self.handle_connect_endpoint();
+        if url == "/ready" {
+            return self.handle_ready_endpoint();
         }
 
         if url.starts_with("/maps") {
@@ -179,6 +246,19 @@ impl Client {
 
         return Err(ClientError::UnknownEndpoint);
     }
+
+    pub fn handle_url_mut(
+        &mut self,
+        url: &str,
+        sinfo: &ServerInfo,
+        body: &str,
+    ) -> Result<ClientResponse, ClientError> {
+        if url == "/setmod" {
+            return self.handle_host_endpoint(&sinfo, body);
+        }
+
+        return Err(ClientError::UnknownEndpoint);
+    }
 }
 
 impl From<&Client> for ClientInfo {
@@ -186,6 +266,7 @@ impl From<&Client> for ClientInfo {
         ClientInfo {
             id: c.id(),
             name: c.name().to_string(),
+            ctype: c.ctype,
         }
     }
 }

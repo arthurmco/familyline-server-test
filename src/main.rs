@@ -1,7 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
 
-use chrono::prelude::*;
 use futures::stream::StreamExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::prelude::*;
@@ -11,11 +10,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 mod client;
-mod server;
 mod request;
+mod server;
 use client::{Client, ClientError, ClientResponse};
-use server::{ClientInfo, ServerDiscoveryInfo, ServerInfo};
 use request::{HTTPRequestInfo, HTTPResponse};
+use server::{ClientInfo, ServerDiscoveryInfo, ServerInfo};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,7 +22,42 @@ use serde_json::Value;
 struct ServerState {
     info: ServerInfo,
     clients: Vec<Client>,
-    host_password: String
+}
+
+fn modify_client<F, R>(state: Arc<RwLock<ServerState>>, client_id: usize, modify_fn: F) -> Option<R>
+where
+    F: FnOnce(&mut Client, &ServerState) -> R,
+{
+    println!("locks: {}", Arc::strong_count(&state));
+    let cstate = Arc::clone(&state);
+    let mut mstate = match cstate.write() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("cannot acquire server state write lock");
+            return None;
+        }
+    };
+
+    let (idx, res, new_client) = match mstate.clients.iter().enumerate().find(|(i, c)| c.id() == client_id) {
+        Some((i, c)) => {
+            let mut cl = c.clone();
+            let res = modify_fn(&mut cl, &mstate);
+            (i, Some(res), Some(cl))
+        }
+        None => (0, None, None),
+    };
+
+    match new_client {
+        Some(nc) => {
+            mstate.clients[idx as usize] = nc;
+            let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
+            mstate.info.update_clients(client_infos);
+            return res;
+        }
+        None => {}
+    }
+    
+    return None;
 }
 
 fn update_client(state: Arc<RwLock<ServerState>>, client_obj: Client) {
@@ -70,7 +104,6 @@ fn is_client_list_full(state: &RwLock<ServerState>) -> bool {
     state.read().unwrap().info.is_client_list_full()
 }
 
-
 fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> HTTPResponse {
     if is_client_list_full(&state) {
         let res = "{\"error\": \"CLIENT_LIST_FULL\", \"description\": \"Cannot log, the client list is full\"}";
@@ -97,11 +130,7 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
             let client_req: ClientLoginRequest = match serde_json::from_str(request_body) {
                 Ok(s) => s,
                 Err(_) => {
-                    return HTTPResponse::new(
-                        400,
-                        "",
-                        vec![],
-                    );
+                    return HTTPResponse::new(400, "", vec![]);
                 }
             };
 
@@ -117,14 +146,27 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
 
             println!("{:?}", state.read().unwrap().clients);
 
-            return HTTPResponse::new(
-                201,
-                &client_res_str,
-                vec![],
-            );
+            return HTTPResponse::new(201, &client_res_str, vec![]);
         }
         None => {
             return HTTPResponse::new(401, "{\"error\": \"No body in login request\"}", vec![]);
+        }
+    }
+}
+
+fn parse_url_handle_result(cres: Result<ClientResponse, ClientError>) -> HTTPResponse {
+    match cres {
+        Ok(res) => {
+            return HTTPResponse::new(200, &res.body, res.headers);
+        }
+        Err(e) => {
+            return match e {
+                ClientError::BadInput => HTTPResponse::new(400, "", vec![]),
+                ClientError::Unauthorized => HTTPResponse::new(401, "", vec![]),
+                ClientError::ResourceNotExist => HTTPResponse::new(404, "", vec![]),
+                ClientError::ServerFailure => HTTPResponse::new(500, "", vec![]),
+                ClientError::UnknownEndpoint => HTTPResponse::new(404, "", vec![]),
+            }
         }
     }
 }
@@ -139,20 +181,12 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
     let request = match HTTPRequestInfo::parse_http_request(s) {
         Some(s) => s,
         None => {
-            return HTTPResponse::new(
-                400,
-                "",
-                vec![],
-            );
+            return HTTPResponse::new(400, "", vec![]);
         }
     };
 
     if request.format.is_none() {
-        return HTTPResponse::new(
-            415,
-            "",
-            vec![],
-        );
+        return HTTPResponse::new(415, "", vec![]);
     }
 
     // We have the following endpoints:
@@ -176,17 +210,13 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
             // we get the client ID, so that we can always find the
             // client, and we do not need to store the client object
             // all times.
-            let client_code = match state.read() {
+            let (client_code, is_url_mutable) = match state.read() {
                 Ok(c) => match c.clients.iter().find(|c| c.code() == code) {
-                    Some(s) => Some(s.id()),
-                    None => None,
+                    Some(s) => (Some(s.id()), s.is_url_mutable(&request.url)),
+                    None => (None, false),
                 },
                 Err(_) => {
-                    return HTTPResponse::new(
-                        500,
-                        "",
-                        vec![],
-                    );
+                    return HTTPResponse::new(500, "", vec![]);
                 }
             };
 
@@ -194,45 +224,46 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                 Some(cid) if request.url.starts_with("/logout") => {
                     eprintln!("removing client id {}", cid);
                     remove_client(Arc::clone(&state), cid);
-                    return HTTPResponse::new(
-                        200,
-                        "",
-                        vec![],
-                    );
+                    return HTTPResponse::new(200, "", vec![]);
+                }
+                Some(cid) if is_url_mutable == true => {
+                    let rbody = if let Some(b) = request.body {
+                        b
+                    } else {
+                        String::from("")
+                    };
+
+                    return parse_url_handle_result({
+                        let rurl = request.url;
+
+                        modify_client(Arc::clone(&state), cid, |mut c, rstate| {
+                            c.handle_url_mut(&rurl, &rstate.info, &rbody)
+                        })
+                        .unwrap()
+                    });
                 }
                 Some(cid) => {
                     let rstate = match state.read() {
                         Ok(c) => c,
                         Err(_) => {
-                            return HTTPResponse::new(
-                                500,
-                                "",
-                                vec![],
-                            );
+                            return HTTPResponse::new(500, "", vec![]);
                         }
                     };
 
                     let c = rstate.clients.iter().find(|c| c.id() == cid).unwrap();
 
-                    match c.handle_url(&request.url, &rstate.info) {
-                        Ok(res) => {
-                            return HTTPResponse::new(
-                                200,
-                                &res.body,
-                                res.headers,
-                            );
-                        }
-                        Err(e) => {
-                            return match e {
-                                ClientError::Unauthorized => HTTPResponse::new(401, "", vec![]),
-                                ClientError::ResourceNotExist => HTTPResponse::new(404, "", vec![]),
-                                ClientError::ServerFailure => HTTPResponse::new(500, "", vec![]),
-                                ClientError::UnknownEndpoint => HTTPResponse::new(404, "", vec![])
-                            }
-                        }
-                    }
+                    let rbody = if let Some(b) = request.body {
+                        b
+                    } else {
+                        String::from("")
+                    };
+                    return parse_url_handle_result(c.handle_url(
+                        &request.url,
+                        &rstate.info,
+                        &rbody,
+                    ));
                 }
-                None => return HTTPResponse::new(403, "", vec![])
+                None => return HTTPResponse::new(403, "", vec![]),
             }
         }
     }
@@ -305,14 +336,17 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
 
 lazy_static! {
     static ref gstate: Arc<RwLock<ServerState>> = Arc::new(RwLock::new(ServerState {
-        info: ServerInfo::new("Test Server", "Server written in Rust, not in C++", 4),
+        info: ServerInfo::new(
+            "Test Server",
+            "Server written in Rust, not in C++",
+            4,
+            "123456"
+        ),
         clients: vec![],
-        host_password: String::from("123456")
     }));
 }
 
 use vecfold::VecFoldResult;
-
 
 /// Since UDP is unreliable, we might need to send the response
 /// packet more than once, because it will not give an error even
@@ -335,7 +369,6 @@ async fn send_multiple(
         Err(e) => Err(std::io::Error::from_raw_os_error(e.raw_os_error().unwrap())),
     }
 }
-
 
 /**
  * TODO:
@@ -405,7 +438,9 @@ async fn main() {
                     };
 
                     let res = request::parse_discover_message(
-                        msg, &ServerDiscoveryInfo::from(&gstate.read().unwrap().info));
+                        msg,
+                        &ServerDiscoveryInfo::from(&gstate.read().unwrap().info),
+                    );
                     if let Some(response) = res {
                         match send_multiple(&mut udp_discover, &sockaddr, response.clone(), 2).await
                         {
