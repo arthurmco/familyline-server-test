@@ -281,6 +281,8 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
     match conn {
         Err(e) => eprintln!("accept failed = {:?}", e),
         Ok(mut sock) => {
+            let source_ip = sock.peer_addr().unwrap().ip().to_string();
+
             // Spawn the future that echos the data and returns how
             // many bytes were copied as a concurrent task.
             tokio::spawn(async move {
@@ -312,7 +314,6 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
 
                             match writer.write(&response.result.into_bytes()).await {
                                 Ok(_) => {
-                                    let source_ip = "10.0.0.0";
                                     let sdate =
                                         response.response_date.format("%d/%b/%Y:%H:%M:%S %z");
                                     println!(
