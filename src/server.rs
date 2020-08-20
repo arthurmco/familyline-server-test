@@ -1,22 +1,5 @@
+use crate::client::{Client, ClientType};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
-pub enum ClientType {
-    #[serde(rename = "normal")]
-    Normal,
-
-    #[serde(rename = "moderator")]
-    Moderator,
-}
-
-// A lightweigt client class, with only the parts that we can
-// send to other clients.
-#[derive(Serialize, Deserialize)]
-pub struct ClientInfo {
-    pub id: usize,
-    pub name: String,
-    pub ctype: ClientType,
-}
 
 #[derive(Copy, Clone, Deserialize, Serialize)]
 pub enum GameStatus {
@@ -33,6 +16,8 @@ pub enum GameStatus {
     Ended,
 }
 
+/// TODO: list only the map hashes on the /info endpointx
+
 #[derive(Serialize, Deserialize)]
 pub struct Map {
     name: String,
@@ -44,7 +29,7 @@ pub struct ServerInfo {
     version: String,
     description: String,
     max_clients: usize,
-    pub clients: Vec<ClientInfo>,
+    clients: Vec<Client>,
     status: GameStatus,
 
     map: Map,
@@ -101,8 +86,20 @@ impl ServerInfo {
         }
     }
 
-    pub fn update_clients(&mut self, v: Vec<ClientInfo>) {
-        self.clients = v
+    pub fn add_client(&mut self, c: Client) {
+        self.clients.push(c);
+    }
+
+    pub fn remove_client(&mut self, id: usize) {
+        self.clients.retain(|c| c.id() != id);
+    }
+
+    pub fn update_client(&mut self, idx: usize, nc: Client) {
+        self.clients[idx] = nc;
+    }
+
+    pub fn get_clients(&self) -> &Vec<Client> {
+        &self.clients
     }
 
     pub fn is_client_list_full(&self) -> bool {

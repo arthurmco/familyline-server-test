@@ -1,23 +1,35 @@
 use rand::Rng;
 
-use crate::server::{ClientInfo, ClientType, ServerInfo};
-use serde::{Deserialize, Serialize, Serializer};
+use crate::server::ServerInfo;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
+pub enum ClientType {
+    #[serde(rename = "normal")]
+    Normal,
+
+    #[serde(rename = "moderator")]
+    Moderator,
+}
+
 /// The current state of the client
 ///
 /// The client is the player, basically
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Client {
     id: usize,
+
+    #[serde(skip)]
     code_seed: usize,
 
     name: String,
 
     /// If true, the client is also connected to the native game
     /// protocol. Usually means that the match already begun
+    #[serde(skip)]
     connected_native: bool,
 
     ctype: ClientType,
@@ -144,7 +156,7 @@ impl Client {
 
         // Do not allow setting the host again in this endpoint
         if sinfo
-            .clients
+            .get_clients()
             .iter()
             .filter(|c| c.ctype == ClientType::Moderator)
             .count()
@@ -258,15 +270,5 @@ impl Client {
         }
 
         return Err(ClientError::UnknownEndpoint);
-    }
-}
-
-impl From<&Client> for ClientInfo {
-    fn from(c: &Client) -> Self {
-        ClientInfo {
-            id: c.id(),
-            name: c.name().to_string(),
-            ctype: c.ctype,
-        }
     }
 }

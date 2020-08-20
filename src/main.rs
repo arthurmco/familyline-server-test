@@ -14,14 +14,13 @@ mod request;
 mod server;
 use client::{Client, ClientError, ClientResponse};
 use request::{HTTPRequestInfo, HTTPResponse};
-use server::{ClientInfo, ServerDiscoveryInfo, ServerInfo};
+use server::{ServerDiscoveryInfo, ServerInfo};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 struct ServerState {
     info: ServerInfo,
-    clients: Vec<Client>,
 }
 
 fn modify_client<F, R>(state: Arc<RwLock<ServerState>>, client_id: usize, modify_fn: F) -> Option<R>
@@ -38,7 +37,13 @@ where
         }
     };
 
-    let (idx, res, new_client) = match mstate.clients.iter().enumerate().find(|(i, c)| c.id() == client_id) {
+    let (idx, res, new_client) = match mstate
+        .info
+        .get_clients()
+        .iter()
+        .enumerate()
+        .find(|(i, c)| c.id() == client_id)
+    {
         Some((i, c)) => {
             let mut cl = c.clone();
             let res = modify_fn(&mut cl, &mstate);
@@ -49,14 +54,12 @@ where
 
     match new_client {
         Some(nc) => {
-            mstate.clients[idx as usize] = nc;
-            let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
-            mstate.info.update_clients(client_infos);
+            mstate.info.update_client(idx as usize, nc);
             return res;
         }
         None => {}
     }
-    
+
     return None;
 }
 
@@ -73,9 +76,7 @@ fn update_client(state: Arc<RwLock<ServerState>>, client_obj: Client) {
             }
         };
 
-        mstate.clients.push(client_obj);
-        let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
-        mstate.info.update_clients(client_infos);
+        mstate.info.add_client(client_obj);
         break;
     }
 }
@@ -93,9 +94,7 @@ fn remove_client(state: Arc<RwLock<ServerState>>, id: usize) {
             }
         };
 
-        mstate.clients.retain(|c| c.id() != id);
-        let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
-        mstate.info.update_clients(client_infos);
+        mstate.info.remove_client(id);
         break;
     }
 }
@@ -142,9 +141,9 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
             };
 
             let client_res_str = serde_json::to_string(&client_res).unwrap();
-            update_client(Arc::clone(&state), client_obj);
+            update_client(Arc::clone(state), client_obj);
 
-            println!("{:?}", state.read().unwrap().clients);
+            println!("clients: {:?}", state.read().unwrap().info.get_clients());
 
             return HTTPResponse::new(201, &client_res_str, vec![]);
         }
@@ -211,7 +210,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
             // client, and we do not need to store the client object
             // all times.
             let (client_code, is_url_mutable) = match state.read() {
-                Ok(c) => match c.clients.iter().find(|c| c.code() == code) {
+                Ok(c) => match c.info.get_clients().iter().find(|c| c.code() == code) {
                     Some(s) => (Some(s.id()), s.is_url_mutable(&request.url)),
                     None => (None, false),
                 },
@@ -220,6 +219,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                 }
             };
 
+            println!("{:?} {:?}", code, client_code);
             match client_code {
                 Some(cid) if request.url.starts_with("/logout") => {
                     eprintln!("removing client id {}", cid);
@@ -250,7 +250,12 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                         }
                     };
 
-                    let c = rstate.clients.iter().find(|c| c.id() == cid).unwrap();
+                    let c = rstate
+                        .info
+                        .get_clients()
+                        .iter()
+                        .find(|c| c.id() == cid)
+                        .unwrap();
 
                     let rbody = if let Some(b) = request.body {
                         b
@@ -275,8 +280,6 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
     match conn {
         Err(e) => eprintln!("accept failed = {:?}", e),
         Ok(mut sock) => {
-            println!("accept succeeded");
-
             // Spawn the future that echos the data and returns how
             // many bytes were copied as a concurrent task.
             tokio::spawn(async move {
@@ -334,6 +337,27 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
     }
 }
 
+/// Basic server structure
+///
+/// Usually things that are static for the server
+pub struct ServerSettings {
+    name: String,
+    version: String,
+    description: String,
+    host_password: String,
+}
+
+impl ServerSettings {
+    pub fn get() -> ServerSettings {
+        ServerSettings {
+            name: String::from("Test Server"),
+            version: String::from("0.1.99"),
+            description: String::from("Server written in Rust, not in C++"),
+            host_password: String::from("123456"),
+        }
+    }
+}
+
 lazy_static! {
     static ref gstate: Arc<RwLock<ServerState>> = Arc::new(RwLock::new(ServerState {
         info: ServerInfo::new(
@@ -342,7 +366,6 @@ lazy_static! {
             4,
             "123456"
         ),
-        clients: vec![],
     }));
 }
 
@@ -372,8 +395,6 @@ async fn send_multiple(
 
 /**
  * TODO:
- *  - add a way to set the mod player, the player (or players) that can
- *    change game settings before the game starts
  *  - add endpoints to change game settings (map, game type, )
  *  - add support for password-protected servers (add authentication on login)
  *  - change the way map download works: if we use the authentication header for
