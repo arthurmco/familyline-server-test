@@ -27,7 +27,6 @@ fn modify_client<F, R>(state: Arc<RwLock<ServerState>>, client_id: usize, modify
 where
     F: FnOnce(&mut Client, &ServerState) -> R,
 {
-    println!("locks: {}", Arc::strong_count(&state));
     let cstate = Arc::clone(&state);
     let mut mstate = match cstate.write() {
         Ok(s) => s,
@@ -64,7 +63,6 @@ where
 }
 
 fn update_client(state: Arc<RwLock<ServerState>>, client_obj: Client) {
-    println!("locks: {}", Arc::strong_count(&state));
     let cstate = Arc::clone(&state);
     for i in 0..100 {
         let mut mstate = match cstate.write() {
@@ -82,7 +80,6 @@ fn update_client(state: Arc<RwLock<ServerState>>, client_obj: Client) {
 }
 
 fn remove_client(state: Arc<RwLock<ServerState>>, id: usize) {
-    println!("locks: {}", Arc::strong_count(&state));
     let cstate = Arc::clone(&state);
     for i in 0..100 {
         let mut mstate = match cstate.try_write() {
@@ -107,7 +104,7 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
     if is_client_list_full(&state) {
         let res = "{\"error\": \"CLIENT_LIST_FULL\", \"description\": \"Cannot log, the client list is full\"}";
 
-        return HTTPResponse::new(503, &res, vec![]);
+        return HTTPResponse::new(503, &res, vec![], &request.url);
     }
 
     match &request.body {
@@ -129,7 +126,7 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
             let client_req: ClientLoginRequest = match serde_json::from_str(request_body) {
                 Ok(s) => s,
                 Err(_) => {
-                    return HTTPResponse::new(400, "", vec![]);
+                    return HTTPResponse::new(400, "", vec![], &request.url);
                 }
             };
 
@@ -143,28 +140,31 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
             let client_res_str = serde_json::to_string(&client_res).unwrap();
             update_client(Arc::clone(state), client_obj);
 
-            println!("clients: {:?}", state.read().unwrap().info.get_clients());
-
-            return HTTPResponse::new(201, &client_res_str, vec![]);
+            return HTTPResponse::new(201, &client_res_str, vec![], &request.url);
         }
         None => {
-            return HTTPResponse::new(401, "{\"error\": \"No body in login request\"}", vec![]);
+            return HTTPResponse::new(
+                401,
+                "{\"error\": \"No body in login request\"}",
+                vec![],
+                &request.url,
+            );
         }
     }
 }
 
-fn parse_url_handle_result(cres: Result<ClientResponse, ClientError>) -> HTTPResponse {
+fn parse_url_handle_result(cres: Result<ClientResponse, ClientError>, url: &str) -> HTTPResponse {
     match cres {
         Ok(res) => {
-            return HTTPResponse::new(200, &res.body, res.headers);
+            return HTTPResponse::new(200, &res.body, res.headers, url);
         }
         Err(e) => {
             return match e {
-                ClientError::BadInput => HTTPResponse::new(400, "", vec![]),
-                ClientError::Unauthorized => HTTPResponse::new(401, "", vec![]),
-                ClientError::ResourceNotExist => HTTPResponse::new(404, "", vec![]),
-                ClientError::ServerFailure => HTTPResponse::new(500, "", vec![]),
-                ClientError::UnknownEndpoint => HTTPResponse::new(404, "", vec![]),
+                ClientError::BadInput => HTTPResponse::new(400, "", vec![], url),
+                ClientError::Unauthorized => HTTPResponse::new(401, "", vec![], url),
+                ClientError::ResourceNotExist => HTTPResponse::new(404, "", vec![], url),
+                ClientError::ServerFailure => HTTPResponse::new(500, "", vec![], url),
+                ClientError::UnknownEndpoint => HTTPResponse::new(404, "", vec![], url),
             }
         }
     }
@@ -180,12 +180,12 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
     let request = match HTTPRequestInfo::parse_http_request(s) {
         Some(s) => s,
         None => {
-            return HTTPResponse::new(400, "", vec![]);
+            return HTTPResponse::new(400, "", vec![], "/");
         }
     };
 
     if request.format.is_none() {
-        return HTTPResponse::new(415, "", vec![]);
+        return HTTPResponse::new(415, "", vec![], &request.url);
     }
 
     // We have the following endpoints:
@@ -215,16 +215,15 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                     None => (None, false),
                 },
                 Err(_) => {
-                    return HTTPResponse::new(500, "", vec![]);
+                    return HTTPResponse::new(500, "", vec![], &request.url);
                 }
             };
 
-            println!("{:?} {:?}", code, client_code);
             match client_code {
                 Some(cid) if request.url.starts_with("/logout") => {
                     eprintln!("removing client id {}", cid);
                     remove_client(Arc::clone(&state), cid);
-                    return HTTPResponse::new(200, "", vec![]);
+                    return HTTPResponse::new(200, "", vec![], &request.url);
                 }
                 Some(cid) if is_url_mutable == true => {
                     let rbody = if let Some(b) = request.body {
@@ -233,20 +232,23 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                         String::from("")
                     };
 
-                    return parse_url_handle_result({
-                        let rurl = request.url;
+                    return parse_url_handle_result(
+                        {
+                            let rurl = request.url.clone();
 
-                        modify_client(Arc::clone(&state), cid, |mut c, rstate| {
-                            c.handle_url_mut(&rurl, &rstate.info, &rbody)
-                        })
-                        .unwrap()
-                    });
+                            modify_client(Arc::clone(&state), cid, |mut c, rstate| {
+                                c.handle_url_mut(&rurl, &rstate.info, &rbody)
+                            })
+                            .unwrap()
+                        },
+                        &request.url,
+                    );
                 }
                 Some(cid) => {
                     let rstate = match state.read() {
                         Ok(c) => c,
                         Err(_) => {
-                            return HTTPResponse::new(500, "", vec![]);
+                            return HTTPResponse::new(500, "", vec![], &request.url);
                         }
                     };
 
@@ -262,18 +264,17 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
                     } else {
                         String::from("")
                     };
-                    return parse_url_handle_result(c.handle_url(
+                    return parse_url_handle_result(
+                        c.handle_url(&request.url, &rstate.info, &rbody),
                         &request.url,
-                        &rstate.info,
-                        &rbody,
-                    ));
+                    );
                 }
-                None => return HTTPResponse::new(403, "", vec![]),
+                None => return HTTPResponse::new(403, "", vec![], &request.url),
             }
         }
     }
 
-    return HTTPResponse::new(404, "", vec![]);
+    return HTTPResponse::new(404, "", vec![], &request.url);
 }
 
 async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<TcpStream, Error>) {
@@ -295,7 +296,6 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
                         Ok(0) => {
                             // Read with length 0 usually means that the client closed the
                             // connection.
-                            println!("closed connection");
                             break;
                         }
                         Ok(size) => {
@@ -309,10 +309,21 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
 
                             // Remember that http messages ends with two \r\n
                             let response = process_http_request(&cstate, s);
-                            println!("{}", response.result);
 
                             match writer.write(&response.result.into_bytes()).await {
-                                Ok(_) => println!(">> R {}b>", size),
+                                Ok(_) => {
+                                    let source_ip = "10.0.0.0";
+                                    let sdate =
+                                        response.response_date.format("%d/%b/%Y:%H:%M:%S %z");
+                                    println!(
+                                        "{} - - [{}] \"GET {} HTTP/1.1\" {} {}",
+                                        source_ip,
+                                        sdate,
+                                        response.request_url,
+                                        response.http_code,
+                                        response.body_size
+                                    )
+                                }
                                 Err(err) => eprintln!("error on write: {:?}", err),
                             }
 

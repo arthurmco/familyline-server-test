@@ -59,11 +59,6 @@ impl HTTPRequestInfo {
                         let url = caps.get(2).unwrap().as_str().to_string();
                         let version = caps.get(3).unwrap().as_str();
 
-                        println!(
-                            "request {} for url {} with http ver {}",
-                            method, url, version
-                        );
-
                         if version != "1.0" && version != "1.1" {
                             return None;
                         }
@@ -139,9 +134,12 @@ impl HTTPRequestInfo {
 }
 
 pub struct HTTPResponse {
+    pub request_url: String,
+    pub response_date: DateTime<Utc>,
+    pub http_code: u32,
     pub result: String,
-
     pub keep_alive: bool,
+    pub body_size: usize,
 }
 
 fn format_rfc2616_date(date: DateTime<Utc>) -> String {
@@ -150,7 +148,12 @@ fn format_rfc2616_date(date: DateTime<Utc>) -> String {
 
 impl HTTPResponse {
     /// Creates the http response
-    pub fn new(http_code: u32, content: &str, additional_headers: Vec<String>) -> HTTPResponse {
+    pub fn new(
+        http_code: u32,
+        content: &str,
+        additional_headers: Vec<String>,
+        request_url: &str,
+    ) -> HTTPResponse {
         let mut lines: Vec<String> = Vec::new();
         let now: DateTime<Utc> = Utc::now();
 
@@ -176,8 +179,9 @@ impl HTTPResponse {
         lines.push("Cache-Control: private, max-age=0".to_string());
         lines.push("Server: familyline-server 0.0.1-test".to_string());
 
-        if body.len() > 0 {
-            lines.push(format!("Content-Length: {}", body.len()));
+        let body_size = body.len();
+        if body_size > 0 {
+            lines.push(format!("Content-Length: {}", body_size));
         }
 
         if http_code >= 200 && http_code <= 299 {
@@ -192,7 +196,11 @@ impl HTTPResponse {
 
         return HTTPResponse {
             result: lines.join("\r\n"),
+            response_date: now,
+            http_code,
             keep_alive: false,
+            request_url: String::from(request_url),
+            body_size,
         };
     }
 }
