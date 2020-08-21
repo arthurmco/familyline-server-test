@@ -376,16 +376,16 @@ fn parse_websocket_message(buf: &Vec<u8>) -> Option<String> {
 
     let lenfield = (buf[1] ^ 0x80);
     let mask_offset = match lenfield {
-        127 => 8,
+        127 => 6,
         126 => 4,
         _ => 2,
     };
     let msglen = match lenfield {
         127 => {
-            let mut l = buf[7] as usize;
-            l |= (buf[6] as usize) << 8;
-            l |= (buf[5] as usize) << 16;
-            l |= (buf[4] as usize) << 24;
+            let mut l = buf[5] as usize;
+            l |= (buf[4] as usize) << 8;
+            l |= (buf[3] as usize) << 16;
+            l |= (buf[2] as usize) << 24;
             l
         }
         126 => {
@@ -418,10 +418,37 @@ fn parse_websocket_message(buf: &Vec<u8>) -> Option<String> {
 }
 
 fn build_websocket_message(data: &str) -> Vec<u8> {
- 
+    let mut v = Vec::<u8>::new();
+    let bdata = data.as_bytes();
+
+    let reallen = bdata.len();
+    let fieldlen = if bdata.len() > 65536 {
+        127
+    } else if bdata.len() > 126 {
+        126
+    } else {
+        reallen as u8
+    };
+
+    v.push(0x81); // FIN, opcode 0x1
+    v.push(fieldlen);
+
+    if fieldlen == 126 {
+        v.push((reallen & 0xff) as u8);
+        v.push((reallen >> 8) as u8);
+    } else if fieldlen == 127 {
+        v.push((reallen & 0xff) as u8);
+        v.push(((reallen >> 8) & 0xff) as u8);
+        v.push(((reallen >> 16) & 0xff) as u8);
+        v.push(((reallen >> 24) & 0xff) as u8);
+    }
+
+    v.extend_from_slice(bdata);
+
+    return v;
 }
 
-async fn handle_chat_conversation(state: &Arc<RwLock<ServerState>>, buf: &Vec<u8>) -> Vec<u8> {
+fn handle_chat_conversation(state: &Arc<RwLock<ServerState>>, buf: &Vec<u8>) -> Vec<u8> {
     println!("{:?}", buf);
 
     match parse_websocket_message(buf) {
@@ -429,7 +456,7 @@ async fn handle_chat_conversation(state: &Arc<RwLock<ServerState>>, buf: &Vec<u8
         None => println!("error or no data"),
     };
 
-    return vec![];
+    return build_websocket_message("received");
 }
 
 fn send_pending_chat_messages(state: &Arc<RwLock<ServerState>>) -> Vec<u8> {
@@ -469,7 +496,7 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
                         }
                         Ok(size) => {
                             if is_chat_conversation {
-                                let ret = handle_chat_conversation(&cstate, &buf).await;
+                                let ret = handle_chat_conversation(&cstate, &buf);
                                 writer.write(&ret).await;
                                 continue;
                             }
