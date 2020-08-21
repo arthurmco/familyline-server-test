@@ -1,6 +1,9 @@
 #[macro_use]
 extern crate lazy_static;
 
+extern crate base64;
+extern crate sha1;
+
 use futures::stream::StreamExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::prelude::*;
@@ -153,10 +156,79 @@ fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> 
     }
 }
 
+/// Check if the websocket headers are valid
+///
+/// Return the websocket key (in the field Sec-WebSocket-Key), or none
+fn has_websocket_headers(headers: &Vec<(String, String)>) -> Option<String> {
+    let mut has_ws = false;
+    let mut has_conn = false;
+    let mut ws_ver: Option<String> = None;
+    let mut ws_key: Option<String> = None;
+
+    for (h, v) in headers {
+        if h == "Upgrade" && v == "websocket" {
+            has_ws = true
+        }
+
+        if h == "Connection" && v == "Upgrade" {
+            has_conn = true
+        }
+
+        if h == "Sec-WebSocket-Version" {
+            ws_ver = Some(String::from(v))
+        }
+
+        if h == "Sec-WebSocket-Key" {
+            ws_key = Some(String::from(v))
+        }
+    }
+
+    if !has_ws
+        || !has_conn
+        || ws_ver.is_none()
+        || ws_ver != Some(String::from("13"))
+        || ws_key.is_none()
+    {
+        return None;
+    }
+
+    return ws_key;
+}
+
+/// Handle the initial handshake, plus the responses of the chat
+///
+/// The chat is websocket-based, so the thread will usually spin on this function.
+fn handle_chat(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> HTTPResponse {
+    // Check if we have the required headers
+    let wskey = match has_websocket_headers(&request.other_headers) {
+        Some(w) => w,
+        None => return HTTPResponse::new(400, "", vec![], &request.url),
+    };
+
+    let mut m = sha1::Sha1::new();
+    let mut retkey = format!("{}{}", wskey, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    m.update(retkey.as_bytes());
+    let serverkey = base64::encode(m.digest().bytes());
+
+    let mut r = HTTPResponse::new(
+        101,
+        "",
+        vec![
+            String::from("Upgrade: websocket"),
+            String::from("Connection: Upgrade"),
+            format!("Sec-Websocket-Accept: {}", serverkey),
+        ],
+        &request.url,
+    );
+
+    r.is_chat_endpoint = true;
+    return r;
+}
+
 fn parse_url_handle_result(cres: Result<ClientResponse, ClientError>, url: &str) -> HTTPResponse {
     match cres {
         Ok(res) => {
-            return HTTPResponse::new(200, &res.body, res.headers, url);
+            return HTTPResponse::new(res.response_code as u32, &res.body, res.headers, url);
         }
         Err(e) => {
             return match e {
@@ -184,7 +256,7 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
         }
     };
 
-    if request.format.is_none() {
+    if request.format.is_none() && (request.url != "/chat" && request.url != "/login") {
         return HTTPResponse::new(415, "", vec![], &request.url);
     }
 
@@ -200,6 +272,10 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
         None => {
             if request.url == "/login".to_string() {
                 return handle_login(&state, &request);
+            }
+
+            if request.url == "/chat".to_string() {
+                return handle_chat(&state, &request);
             }
         }
         Some(code) => {
@@ -277,6 +353,89 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
     return HTTPResponse::new(404, "", vec![], &request.url);
 }
 
+/// Decode a websocket message, return the string, or None
+fn parse_websocket_message(buf: &Vec<u8>) -> Option<String> {
+    let is_fin = ((buf[0] >> 4) & 0x1) > 0;
+
+    let opcode = buf[0] & 0xf;
+
+    println!("\tfin {}, opcode {}", is_fin, opcode);
+
+    if opcode == 0x2 {
+        // Not text
+        return None;
+    }
+
+    let masked = (buf[1] >> 0x7) > 0;
+    println!("\tmasked {}", masked);
+
+    if !masked {
+        // The server cannot accept unmasked client messages
+        return None;
+    }
+
+    let lenfield = (buf[1] ^ 0x80);
+    let mask_offset = match lenfield {
+        127 => 8,
+        126 => 4,
+        _ => 2,
+    };
+    let msglen = match lenfield {
+        127 => {
+            let mut l = buf[7] as usize;
+            l |= (buf[6] as usize) << 8;
+            l |= (buf[5] as usize) << 16;
+            l |= (buf[4] as usize) << 24;
+            l
+        }
+        126 => {
+            let mut l = buf[3] as usize;
+            l |= (buf[2] as usize) << 8;
+            l
+        }
+        _ => lenfield as usize,
+    };
+
+    let content_offset = mask_offset + 4;
+    let mask = &buf[mask_offset..content_offset];
+
+    println!("\tlen: {}, ws mask: {:?}", msglen, mask);
+
+    let content_bytes = &buf[content_offset..];
+    let content_decoded = content_bytes
+        .into_iter()
+        .enumerate()
+        .map(|(i, x)| x ^ mask[i % 4])
+        .take(msglen)
+        .collect();
+
+    println!("\t {:?}", content_decoded);
+
+    match String::from_utf8(content_decoded) {
+        Ok(s) => Some(s),
+        Err(_) => None,
+    }
+}
+
+fn build_websocket_message(data: &str) -> Vec<u8> {
+ 
+}
+
+async fn handle_chat_conversation(state: &Arc<RwLock<ServerState>>, buf: &Vec<u8>) -> Vec<u8> {
+    println!("{:?}", buf);
+
+    match parse_websocket_message(buf) {
+        Some(s) => println!("{}", s),
+        None => println!("error or no data"),
+    };
+
+    return vec![];
+}
+
+fn send_pending_chat_messages(state: &Arc<RwLock<ServerState>>) -> Vec<u8> {
+    return vec![];
+}
+
 async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<TcpStream, Error>) {
     match conn {
         Err(e) => eprintln!("accept failed = {:?}", e),
@@ -291,9 +450,17 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
                 let cstate = Arc::clone(&state);
 
                 let (mut reader, mut writer) = sock.split();
+                let mut is_chat_conversation = false;
 
                 loop {
-                    let mut buf = vec![0 as u8; 1024];
+                    if is_chat_conversation {
+                        let ret = send_pending_chat_messages(&cstate);
+                        if ret.len() > 0 {
+                            writer.write(&ret).await;
+                        }
+                    }
+
+                    let mut buf = vec![0 as u8; 4096];
                     match reader.read(&mut buf).await {
                         Ok(0) => {
                             // Read with length 0 usually means that the client closed the
@@ -301,6 +468,12 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
                             break;
                         }
                         Ok(size) => {
+                            if is_chat_conversation {
+                                let ret = handle_chat_conversation(&cstate, &buf).await;
+                                writer.write(&ret).await;
+                                continue;
+                            }
+
                             let s = match String::from_utf8(buf) {
                                 Ok(res) => res,
                                 Err(err) => {
@@ -328,22 +501,16 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
                                 Err(err) => eprintln!("error on write: {:?}", err),
                             }
 
-                            if !response.keep_alive {
+                            if !response.is_chat_endpoint {
                                 break;
+                            } else {
+                                eprintln!("<client {} opened the chat websocket", source_ip);
+                                is_chat_conversation = true;
                             }
                         }
                         Err(err) => eprintln!("error on read: {:?}", err),
                     }
                 }
-
-                //match tokio::io::copy(&mut reader, &mut writer).await {
-                //    Ok(amt) => {
-                //        println!("wrote {} bytes", amt);
-                //    }
-                //    Err(err) => {
-                //        eprintln!("IO error {:?}", err);
-                //    }
-                //}
             });
         }
     }

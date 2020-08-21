@@ -5,6 +5,7 @@ use regex::Regex;
 use crate::server::ServerDiscoveryInfo;
 
 /// Represents what was found in the http request
+#[derive(Debug)]
 pub struct HTTPRequestInfo {
     // General headers
     pub url: String,
@@ -12,6 +13,7 @@ pub struct HTTPRequestInfo {
     pub format: Option<String>,
     pub auth: Option<String>,
     pub length: Option<usize>,
+    pub other_headers: Vec<(String, String)>,
 
     // Body
     pub body: Option<String>,
@@ -37,9 +39,13 @@ impl HTTPRequestInfo {
         let mut length_format: Option<usize> = None;
         let length_regex = Regex::new(r"Content-Length: (.*)").unwrap();
 
+        let mut other_headers: Vec<(String, String)> = vec![];
+
         let mut body = None;
 
         for line in s.split("\n") {
+            println!("{}", line);
+
             // An empty line means that the next line is the body
             if line == "\r" || line == "" {
                 body = Some("".to_string());
@@ -63,7 +69,8 @@ impl HTTPRequestInfo {
                             return None;
                         }
 
-                        request_url = Some((method, url))
+                        request_url = Some((method, url));
+                        continue;
                     }
                 }
 
@@ -79,6 +86,7 @@ impl HTTPRequestInfo {
                         }) {
                             Some(fmt) => {
                                 request_format = Some(fmt.trim().to_string());
+                                continue;
                             }
                             None => {}
                         }
@@ -90,7 +98,8 @@ impl HTTPRequestInfo {
                 if auth_format.is_none() {
                     if let Some(caps) = auth_regex.captures(line) {
                         let auth_data = caps.get(1).unwrap().as_str();
-                        auth_format = Some(auth_data.trim().to_string())
+                        auth_format = Some(auth_data.trim().to_string());
+                        continue;
                     }
                 }
 
@@ -100,7 +109,8 @@ impl HTTPRequestInfo {
                 if code_format.is_none() {
                     if let Some(caps) = code_regex.captures(line) {
                         let code_data = caps.get(1).unwrap().as_str();
-                        code_format = Some(code_data.trim().to_string())
+                        code_format = Some(code_data.trim().to_string());
+                        continue;
                     }
                 }
 
@@ -115,6 +125,17 @@ impl HTTPRequestInfo {
                         }
                     }
                 }
+
+                if request_url.is_some() {
+                    let mut fields = line.splitn(2, ":");
+                    match fields.nth(0) {
+                        Some(h) => other_headers.push((
+                            h.trim().to_string(),
+                            fields.nth(0).unwrap_or_default().trim().to_string(),
+                        )),
+                        None => (),
+                    }
+                }
             }
         }
 
@@ -126,6 +147,7 @@ impl HTTPRequestInfo {
                 format: request_format,
                 auth: auth_format,
                 length: length_format,
+                other_headers,
                 body: body,
                 player_code: code_format,
             }),
@@ -138,7 +160,7 @@ pub struct HTTPResponse {
     pub response_date: DateTime<Utc>,
     pub http_code: u32,
     pub result: String,
-    pub keep_alive: bool,
+    pub is_chat_endpoint: bool,
     pub body_size: usize,
 }
 
@@ -192,13 +214,15 @@ impl HTTPResponse {
 
         lines.push("".to_string());
 
+        println!("{:?}", &lines);
+
         lines.push(body);
 
         return HTTPResponse {
             result: lines.join("\r\n"),
             response_date: now,
             http_code,
-            keep_alive: false,
+            is_chat_endpoint: false,
             request_url: String::from(request_url),
             body_size,
         };

@@ -78,6 +78,7 @@ impl Error for ClientError {
 pub struct ClientResponse {
     pub headers: Vec<String>,
     pub body: String,
+    pub response_code: usize,
 }
 
 impl Client {
@@ -127,6 +128,7 @@ impl Client {
             Ok(res) => Ok(ClientResponse {
                 headers: vec![],
                 body: res,
+                response_code: 200,
             }),
             Err(_) => Err(ClientError::ServerFailure),
         }
@@ -139,6 +141,7 @@ impl Client {
                 "Upgrade: familyline-server-protocol/0.0.1".to_string(),
             ],
             body: "!FL READY localhost 32000\n\n".to_string(),
+            response_code: 101,
         })
     }
 
@@ -176,6 +179,7 @@ impl Client {
             return Ok(ClientResponse {
                 headers: vec![],
                 body: String::from(""),
+                response_code: 200,
             });
         } else {
             return Err(ClientError::Unauthorized);
@@ -187,6 +191,7 @@ impl Client {
             return Ok(ClientResponse {
                 headers: vec!["Content-Type: application/octet-stream".to_string()],
                 body: "FMAPAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                response_code: 200,
             });
         } else {
             return Err(ClientError::Unauthorized);
@@ -218,6 +223,7 @@ impl Client {
             Ok(res) => Ok(ClientResponse {
                 headers: vec![format!("Content-Length: {}", res.len())],
                 body: res,
+                response_code: 200,
             }),
             Err(_) => Err(ClientError::ServerFailure),
         }
@@ -227,7 +233,7 @@ impl Client {
     pub fn is_url_mutable(&self, url: &str) -> bool {
         // Please change this when the list gets big.
 
-        if url.starts_with("/setmod") {
+        if url.starts_with("/setmod") || url.starts_with("/chat") {
             return true;
         }
 

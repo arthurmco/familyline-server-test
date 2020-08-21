@@ -20,3 +20,6 @@ lazy_static = "1.4.0"
 pnet = "0.25.0"
 
 vecfold = "0.1.6"
+
+sha1 = "0.6.0"
+base64 = "0.12.3"
