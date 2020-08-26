@@ -8,23 +8,25 @@ use futures::stream::StreamExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::prelude::*;
 
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
+mod chat;
 mod client;
 mod request;
 mod server;
+mod state;
+use chat::{handle_chat_conversation, send_pending_chat_messages, ChatMessage};
 use client::{Client, ClientError, ClientResponse};
 use request::{HTTPRequestInfo, HTTPResponse};
 use server::{ServerDiscoveryInfo, ServerInfo};
+use state::ServerState;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-struct ServerState {
-    info: ServerInfo,
-}
 
 fn modify_client<F, R>(state: Arc<RwLock<ServerState>>, client_id: usize, modify_fn: F) -> Option<R>
 where
@@ -353,116 +355,6 @@ fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResp
     return HTTPResponse::new(404, "", vec![], &request.url);
 }
 
-/// Decode a websocket message, return the string, or None
-fn parse_websocket_message(buf: &Vec<u8>) -> Option<String> {
-    let is_fin = ((buf[0] >> 4) & 0x1) > 0;
-
-    let opcode = buf[0] & 0xf;
-
-    println!("\tfin {}, opcode {}", is_fin, opcode);
-
-    if opcode == 0x2 {
-        // Not text
-        return None;
-    }
-
-    let masked = (buf[1] >> 0x7) > 0;
-    println!("\tmasked {}", masked);
-
-    if !masked {
-        // The server cannot accept unmasked client messages
-        return None;
-    }
-
-    let lenfield = (buf[1] ^ 0x80);
-    let mask_offset = match lenfield {
-        127 => 6,
-        126 => 4,
-        _ => 2,
-    };
-    let msglen = match lenfield {
-        127 => {
-            let mut l = buf[5] as usize;
-            l |= (buf[4] as usize) << 8;
-            l |= (buf[3] as usize) << 16;
-            l |= (buf[2] as usize) << 24;
-            l
-        }
-        126 => {
-            let mut l = buf[3] as usize;
-            l |= (buf[2] as usize) << 8;
-            l
-        }
-        _ => lenfield as usize,
-    };
-
-    let content_offset = mask_offset + 4;
-    let mask = &buf[mask_offset..content_offset];
-
-    println!("\tlen: {}, ws mask: {:?}", msglen, mask);
-
-    let content_bytes = &buf[content_offset..];
-    let content_decoded = content_bytes
-        .into_iter()
-        .enumerate()
-        .map(|(i, x)| x ^ mask[i % 4])
-        .take(msglen)
-        .collect();
-
-    println!("\t {:?}", content_decoded);
-
-    match String::from_utf8(content_decoded) {
-        Ok(s) => Some(s),
-        Err(_) => None,
-    }
-}
-
-fn build_websocket_message(data: &str) -> Vec<u8> {
-    let mut v = Vec::<u8>::new();
-    let bdata = data.as_bytes();
-
-    let reallen = bdata.len();
-    let fieldlen = if bdata.len() > 65536 {
-        127
-    } else if bdata.len() > 126 {
-        126
-    } else {
-        reallen as u8
-    };
-
-    v.push(0x81); // FIN, opcode 0x1
-    v.push(fieldlen);
-
-    if fieldlen == 126 {
-        v.push((reallen & 0xff) as u8);
-        v.push((reallen >> 8) as u8);
-    } else if fieldlen == 127 {
-        v.push((reallen & 0xff) as u8);
-        v.push(((reallen >> 8) & 0xff) as u8);
-        v.push(((reallen >> 16) & 0xff) as u8);
-        v.push(((reallen >> 24) & 0xff) as u8);
-    }
-
-    v.extend_from_slice(bdata);
-
-    return v;
-}
-
-fn handle_chat_conversation(state: &Arc<RwLock<ServerState>>, buf: &Vec<u8>) -> Vec<u8> {
-    println!("{:?}", buf);
-
-    match parse_websocket_message(buf) {
-        Some(s) => println!("{}", s),
-        None => println!("error or no data"),
-    };
-
-    return build_websocket_message("received");
-}
-
-fn send_pending_chat_messages(state: &Arc<RwLock<ServerState>>) -> Vec<u8> {
-    return vec![];
-}
-
 async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<TcpStream, Error>) {
     match conn {
         Err(e) => eprintln!("accept failed = {:?}", e),
@@ -497,7 +389,11 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
                         Ok(size) => {
                             if is_chat_conversation {
                                 let ret = handle_chat_conversation(&cstate, &buf);
-                                writer.write(&ret).await;
+
+                                if ret.len() > 0 {
+                                    writer.write(&ret).await;
+                                }
+
                                 continue;
                             }
 
@@ -572,6 +468,7 @@ lazy_static! {
             4,
             "123456"
         ),
+        chats: HashMap::new(),
     }));
 }
 
