@@ -1,6 +1,7 @@
 use crate::state::ServerState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 /// Decode a websocket message, return the string, or None
@@ -91,7 +92,7 @@ fn build_websocket_message(data: &str) -> Vec<u8> {
     return v;
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatMessage {
     /// Tick number that the message was sent
     /// For pre-match messages, this value is 0
@@ -107,7 +108,30 @@ pub struct ChatMessage {
     pub message: String,
 }
 
-pub fn handle_chat_conversation(state: &Arc<RwLock<ServerState>>, buf: &Vec<u8>) -> Vec<u8> {
+fn push_message(state: &Arc<RwLock<ServerState>>, cm: &ChatMessage, client_id: usize) {
+    let pushed = {
+        match state.write().unwrap().chats.get_mut(&client_id) {
+            Some(ref mut queue) => {
+                queue.push_back(cm.clone());
+                true
+            }
+            None => false,
+        }
+    };
+
+    if !pushed {
+        let mut chatqueue = VecDeque::new();
+        chatqueue.push_back(cm.clone());
+
+        state.write().unwrap().chats.insert(client_id, chatqueue);
+    }
+}
+
+pub fn handle_chat_conversation(
+    state: &Arc<RwLock<ServerState>>,
+    buf: &Vec<u8>,
+    client_id: usize,
+) -> Vec<u8> {
     let s = match parse_websocket_message(buf) {
         Some(s) => s,
         None => {
@@ -123,11 +147,38 @@ pub fn handle_chat_conversation(state: &Arc<RwLock<ServerState>>, buf: &Vec<u8>)
         }
     };
 
-    println!("{}: {}", chat_msg.sender, chat_msg.message);
+    push_message(&state, &chat_msg, client_id);
 
-    return build_websocket_message(&format!("{}", chat_msg.message));
+    return send_pending_chat_messages(&state, client_id);
 }
 
-pub fn send_pending_chat_messages(state: &Arc<RwLock<ServerState>>) -> Vec<u8> {
-    return vec![];
+pub fn send_pending_chat_messages(state: &Arc<RwLock<ServerState>>, client_id: usize) -> Vec<u8> {
+    let recvet: Vec<ChatMessage> = {
+        let sread = state.read().unwrap();
+        let chatqueue = sread.chats.get(&client_id);
+
+        match chatqueue {
+            Some(ref queue) => queue
+                .iter()
+                .filter(|c| c.sender == client_id)
+                .map(|c| c.clone())
+                .collect(),
+            None => vec![],
+        }
+    };
+
+    let messagelist = match state.write().unwrap().chats.get_mut(&client_id) {
+        Some(ref mut queue) => {
+            queue.retain(|c| c.sender != client_id);
+            recvet
+        }
+        None => recvet,
+    };
+
+    if messagelist.len() == 0 {
+        return vec![];
+    }
+
+    let messagestr = serde_json::to_string(&messagelist).unwrap();
+    return build_websocket_message(&messagestr);
 }

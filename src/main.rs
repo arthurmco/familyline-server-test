@@ -370,10 +370,11 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
 
                 let (mut reader, mut writer) = sock.split();
                 let mut is_chat_conversation = false;
+                let client_id = 0;
 
                 loop {
                     if is_chat_conversation {
-                        let ret = send_pending_chat_messages(&cstate);
+                        let ret = send_pending_chat_messages(&cstate, client_id);
                         if ret.len() > 0 {
                             writer.write(&ret).await;
                         }
@@ -388,7 +389,7 @@ async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<T
                         }
                         Ok(size) => {
                             if is_chat_conversation {
-                                let ret = handle_chat_conversation(&cstate, &buf);
+                                let ret = handle_chat_conversation(&cstate, &buf, client_id);
 
                                 if ret.len() > 0 {
                                     writer.write(&ret).await;
