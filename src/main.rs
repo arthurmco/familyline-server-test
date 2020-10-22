@@ -1,46 +1,20 @@
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::net::SocketAddr;
-
 use warp::{
     http::{Response, StatusCode},
     Filter,
 };
 
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::oneshot;
 
-struct ServerConfiguration {
-    port: u16,
-}
+mod messages;
 
-impl ServerConfiguration {
-    pub fn load() -> ServerConfiguration {
-        ServerConfiguration { port: 8100 }
-    }
-}
-
-///////////
-
-enum ChatReceiver {
-    All,
-    Team(u32),
-    Client(u64)
-}
-
-struct ChatMessage {
-    sender_id: u64,
-    content: String
-}
-
-/////////
-
-enum RequestMessage {
-    Login(u64),
-    GetServerInfo,
-    GetClientInfo(u64),
-    
-    SendMessage(ChatReceiver, String),
-    ReceiveMessages(Vec<ChatMessage>)
-}
-    
-//////////
+use messages::ServerConfiguration;
+use messages::ValidateLoginError;
+use messages::{send_info_message, send_login_message};
+use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
 
 /**
  * Our endpoints
@@ -62,25 +36,100 @@ enum RequestMessage {
  * TODO: how an spectator will connect?
  */
 
+/// Open a request channel
+///
+/// Both the HTTP login API and the game server will use it
+/// to request data.
+fn create_request_channel(config: &ServerConfiguration) -> Sender<FMessage> {
+    return start_message_processor(config);
+}
 
-async fn run_http_server(config: &ServerConfiguration) {
+#[derive(Deserialize, Serialize)]
+struct LoginBody {
+    name: String,
+}
 
+#[derive(Deserialize, Serialize)]
+struct AuthBody {
+    token: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct BasicError {
+    message: String,
+}
+
+async fn serve_login(
+    body: LoginBody,
+    sender: Sender<FMessage>,
+) -> Result<impl warp::Reply, Infallible> {
+    let mut sender = sender.clone();
+
+    match send_login_message(&mut sender, &body.name).await {
+        Ok(login) => Ok(warp::reply::with_status(
+            warp::reply::json(&login),
+            StatusCode::CREATED,
+        )),
+        Err(_) => Ok(warp::reply::with_status(
+            warp::reply::json(&BasicError {
+                message: String::from("Login failure"),
+            }),
+            StatusCode::BAD_REQUEST,
+        )),
+    }
+}
+
+async fn serve_info(
+    body: AuthBody,
+    sender: Sender<FMessage>,
+) -> Result<impl warp::Reply, Infallible> {
+    let mut sender = sender.clone();
+
+    match send_info_message(&mut sender, &body.token).await {
+        Ok(sinfo) => Ok(warp::reply::with_status(
+            warp::reply::json(&sinfo),
+            StatusCode::OK,
+        )),
+        Err(e) => match e {
+            ValidateLoginError::InvalidToken => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Invalid token"),
+                }),
+                StatusCode::UNAUTHORIZED,
+            )),
+        },
+    }
+}
+
+fn with_sender(
+    sender: Sender<FMessage>,
+) -> impl Filter<Extract = (Sender<FMessage>,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || sender.clone())
+}
+
+/// Setup and run the HTTP login server
+async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>) {
     let login = warp::post()
         .and(warp::path("login"))
-        .map(|| "Logging in");
-        
+        .and(warp::body::content_length_limit(1024))
+        .and(warp::body::json())
+        .and(with_sender(sender.clone()))
+        .and_then(serve_login);
 
-    let test = warp::get()
-        .and(warp::path("test"))
-        .map(|| "Hello world!");
+    let info = warp::post()
+        .and(warp::path("info"))
+        .and(warp::body::content_length_limit(1024))
+        .and(warp::body::json())
+        .and(with_sender(sender.clone()))
+        .and_then(serve_info);
+
+    let test = warp::get().and(warp::path("test")).map(|| "Hello world!");
 
     let clients = warp::get()
-        .and(warp::path!("clients" / u64)).map(
-            |cid| format!("Getting client {}", cid));
+        .and(warp::path!("clients" / u64))
+        .map(|cid| format!("Getting client {}", cid));
 
-        
-    
-    let server = warp::serve(login.or(test).or(clients));
+    let server = warp::serve(login.or(info).or(test).or(clients));
 
     println!("Server started at 127.0.0.1:{}", config.port);
 
@@ -95,5 +144,6 @@ async fn main() {
 
     let config = ServerConfiguration::load();
 
-    run_http_server(&config).await;
+    let sender = create_request_channel(&config);
+    run_http_server(&config, sender).await;
 }
