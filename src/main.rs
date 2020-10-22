@@ -1,465 +1,99 @@
-#[macro_use]
-extern crate lazy_static;
+use std::net::SocketAddr;
 
-use futures::stream::StreamExt;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::prelude::*;
+use warp::{
+    http::{Response, StatusCode},
+    Filter,
+};
 
-use std::io::Error;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
 
-mod client;
-mod request;
-mod server;
-use client::{Client, ClientError, ClientResponse};
-use request::{HTTPRequestInfo, HTTPResponse};
-use server::{ClientInfo, ServerDiscoveryInfo, ServerInfo};
-
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
-struct ServerState {
-    info: ServerInfo,
-    clients: Vec<Client>,
+struct ServerConfiguration {
+    port: u16,
 }
 
-fn modify_client<F, R>(state: Arc<RwLock<ServerState>>, client_id: usize, modify_fn: F) -> Option<R>
-where
-    F: FnOnce(&mut Client, &ServerState) -> R,
-{
-    println!("locks: {}", Arc::strong_count(&state));
-    let cstate = Arc::clone(&state);
-    let mut mstate = match cstate.write() {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("cannot acquire server state write lock");
-            return None;
-        }
-    };
-
-    let (idx, res, new_client) = match mstate.clients.iter().enumerate().find(|(i, c)| c.id() == client_id) {
-        Some((i, c)) => {
-            let mut cl = c.clone();
-            let res = modify_fn(&mut cl, &mstate);
-            (i, Some(res), Some(cl))
-        }
-        None => (0, None, None),
-    };
-
-    match new_client {
-        Some(nc) => {
-            mstate.clients[idx as usize] = nc;
-            let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
-            mstate.info.update_clients(client_infos);
-            return res;
-        }
-        None => {}
+impl ServerConfiguration {
+    pub fn load() -> ServerConfiguration {
+        ServerConfiguration { port: 8100 }
     }
+}
+
+///////////
+
+enum ChatReceiver {
+    All,
+    Team(u32),
+    Client(u64)
+}
+
+struct ChatMessage {
+    sender_id: u64,
+    content: String
+}
+
+/////////
+
+enum RequestMessage {
+    Login(u64),
+    GetServerInfo,
+    GetClientInfo(u64),
     
-    return None;
+    SendMessage(ChatReceiver, String),
+    ReceiveMessages(Vec<ChatMessage>)
 }
-
-fn update_client(state: Arc<RwLock<ServerState>>, client_obj: Client) {
-    println!("locks: {}", Arc::strong_count(&state));
-    let cstate = Arc::clone(&state);
-    for i in 0..100 {
-        let mut mstate = match cstate.write() {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("cannot acquire server state write lock");
-                std::thread::sleep(std::time::Duration::from_millis(i * 40));
-                continue;
-            }
-        };
-
-        mstate.clients.push(client_obj);
-        let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
-        mstate.info.update_clients(client_infos);
-        break;
-    }
-}
-
-fn remove_client(state: Arc<RwLock<ServerState>>, id: usize) {
-    println!("locks: {}", Arc::strong_count(&state));
-    let cstate = Arc::clone(&state);
-    for i in 0..100 {
-        let mut mstate = match cstate.try_write() {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("cannot acquire server state write lock");
-                std::thread::sleep(std::time::Duration::from_millis(i * 40));
-                continue;
-            }
-        };
-
-        mstate.clients.retain(|c| c.id() != id);
-        let client_infos = mstate.clients.iter().map(|c| ClientInfo::from(c)).collect();
-        mstate.info.update_clients(client_infos);
-        break;
-    }
-}
-
-fn is_client_list_full(state: &RwLock<ServerState>) -> bool {
-    state.read().unwrap().info.is_client_list_full()
-}
-
-fn handle_login(state: &Arc<RwLock<ServerState>>, request: &HTTPRequestInfo) -> HTTPResponse {
-    if is_client_list_full(&state) {
-        let res = "{\"error\": \"CLIENT_LIST_FULL\", \"description\": \"Cannot log, the client list is full\"}";
-
-        return HTTPResponse::new(503, &res, vec![]);
-    }
-
-    match &request.body {
-        Some(s) => {
-            #[derive(Serialize, Deserialize)]
-            struct ClientLoginRequest {
-                client_name: String,
-            };
-
-            #[derive(Serialize, Deserialize)]
-            struct ClientLoginResponse {
-                id: usize,
-                code: String,
-                name: String,
-            };
-
-            let request_body = s.trim().trim_matches(char::from(0));
-
-            let client_req: ClientLoginRequest = match serde_json::from_str(request_body) {
-                Ok(s) => s,
-                Err(_) => {
-                    return HTTPResponse::new(400, "", vec![]);
-                }
-            };
-
-            let client_obj = Client::new(&client_req.client_name);
-            let client_res = ClientLoginResponse {
-                id: client_obj.id(),
-                code: client_obj.code(),
-                name: client_obj.name().to_string(),
-            };
-
-            let client_res_str = serde_json::to_string(&client_res).unwrap();
-            update_client(Arc::clone(&state), client_obj);
-
-            println!("{:?}", state.read().unwrap().clients);
-
-            return HTTPResponse::new(201, &client_res_str, vec![]);
-        }
-        None => {
-            return HTTPResponse::new(401, "{\"error\": \"No body in login request\"}", vec![]);
-        }
-    }
-}
-
-fn parse_url_handle_result(cres: Result<ClientResponse, ClientError>) -> HTTPResponse {
-    match cres {
-        Ok(res) => {
-            return HTTPResponse::new(200, &res.body, res.headers);
-        }
-        Err(e) => {
-            return match e {
-                ClientError::BadInput => HTTPResponse::new(400, "", vec![]),
-                ClientError::Unauthorized => HTTPResponse::new(401, "", vec![]),
-                ClientError::ResourceNotExist => HTTPResponse::new(404, "", vec![]),
-                ClientError::ServerFailure => HTTPResponse::new(500, "", vec![]),
-                ClientError::UnknownEndpoint => HTTPResponse::new(404, "", vec![]),
-            }
-        }
-    }
-}
+    
+//////////
 
 /**
- * Process an http request.
+ * Our endpoints
  *
- * Returns a response to be sent.
- * We consume the http request string, watch out for this.
- */
-fn process_http_request(state: &Arc<RwLock<ServerState>>, s: String) -> HTTPResponse {
-    let request = match HTTPRequestInfo::parse_http_request(s) {
-        Some(s) => s,
-        None => {
-            return HTTPResponse::new(400, "", vec![]);
-        }
-    };
-
-    if request.format.is_none() {
-        return HTTPResponse::new(415, "", vec![]);
-    }
-
-    // We have the following endpoints:
-    //  - /login (POST) - log in into the lobby
-    //  - /logout (POST)
-    //  - /info (GET) - get server information
-    //  - /ready (POST) - set the client status as ready to start the game
-    //  - /client/<code>/mod (POST) - set/unset moderator status to the specified
-    //                                client
-
-    match request.player_code {
-        None => {
-            if request.url == "/login".to_string() {
-                return handle_login(&state, &request);
-            }
-        }
-        Some(code) => {
-            // Read the client code first
-            // Since we cannot held a read lock while writing, and we
-            // write to the state variable in some of the endpoints,
-            // we get the client ID, so that we can always find the
-            // client, and we do not need to store the client object
-            // all times.
-            let (client_code, is_url_mutable) = match state.read() {
-                Ok(c) => match c.clients.iter().find(|c| c.code() == code) {
-                    Some(s) => (Some(s.id()), s.is_url_mutable(&request.url)),
-                    None => (None, false),
-                },
-                Err(_) => {
-                    return HTTPResponse::new(500, "", vec![]);
-                }
-            };
-
-            match client_code {
-                Some(cid) if request.url.starts_with("/logout") => {
-                    eprintln!("removing client id {}", cid);
-                    remove_client(Arc::clone(&state), cid);
-                    return HTTPResponse::new(200, "", vec![]);
-                }
-                Some(cid) if is_url_mutable == true => {
-                    let rbody = if let Some(b) = request.body {
-                        b
-                    } else {
-                        String::from("")
-                    };
-
-                    return parse_url_handle_result({
-                        let rurl = request.url;
-
-                        modify_client(Arc::clone(&state), cid, |mut c, rstate| {
-                            c.handle_url_mut(&rurl, &rstate.info, &rbody)
-                        })
-                        .unwrap()
-                    });
-                }
-                Some(cid) => {
-                    let rstate = match state.read() {
-                        Ok(c) => c,
-                        Err(_) => {
-                            return HTTPResponse::new(500, "", vec![]);
-                        }
-                    };
-
-                    let c = rstate.clients.iter().find(|c| c.id() == cid).unwrap();
-
-                    let rbody = if let Some(b) = request.body {
-                        b
-                    } else {
-                        String::from("")
-                    };
-                    return parse_url_handle_result(c.handle_url(
-                        &request.url,
-                        &rstate.info,
-                        &rbody,
-                    ));
-                }
-                None => return HTTPResponse::new(403, "", vec![]),
-            }
-        }
-    }
-
-    return HTTPResponse::new(404, "", vec![]);
-}
-
-async fn process_client(state: &'static Arc<RwLock<ServerState>>, conn: Result<TcpStream, Error>) {
-    match conn {
-        Err(e) => eprintln!("accept failed = {:?}", e),
-        Ok(mut sock) => {
-            println!("accept succeeded");
-
-            // Spawn the future that echos the data and returns how
-            // many bytes were copied as a concurrent task.
-            tokio::spawn(async move {
-                // Split up the reading and writing parts of the
-                // socket.
-                let cstate = Arc::clone(&state);
-
-                let (mut reader, mut writer) = sock.split();
-
-                loop {
-                    let mut buf = vec![0 as u8; 1024];
-                    match reader.read(&mut buf).await {
-                        Ok(0) => {
-                            // Read with length 0 usually means that the client closed the
-                            // connection.
-                            println!("closed connection");
-                            break;
-                        }
-                        Ok(size) => {
-                            let s = match String::from_utf8(buf) {
-                                Ok(res) => res,
-                                Err(err) => {
-                                    eprintln!("error on utf8 conversion: {:?}", err);
-                                    continue;
-                                }
-                            };
-
-                            // Remember that http messages ends with two \r\n
-                            let response = process_http_request(&cstate, s);
-                            println!("{}", response.result);
-
-                            match writer.write(&response.result.into_bytes()).await {
-                                Ok(_) => println!(">> R {}b>", size),
-                                Err(err) => eprintln!("error on write: {:?}", err),
-                            }
-
-                            if !response.keep_alive {
-                                break;
-                            }
-                        }
-                        Err(err) => eprintln!("error on read: {:?}", err),
-                    }
-                }
-
-                //match tokio::io::copy(&mut reader, &mut writer).await {
-                //    Ok(amt) => {
-                //        println!("wrote {} bytes", amt);
-                //    }
-                //    Err(err) => {
-                //        eprintln!("IO error {:?}", err);
-                //    }
-                //}
-            });
-        }
-    }
-}
-
-lazy_static! {
-    static ref gstate: Arc<RwLock<ServerState>> = Arc::new(RwLock::new(ServerState {
-        info: ServerInfo::new(
-            "Test Server",
-            "Server written in Rust, not in C++",
-            4,
-            "123456"
-        ),
-        clients: vec![],
-    }));
-}
-
-use vecfold::VecFoldResult;
-
-/// Since UDP is unreliable, we might need to send the response
-/// packet more than once, because it will not give an error even
-/// if the packet did not reach its destination.
-async fn send_multiple(
-    socket: &mut UdpSocket,
-    addr: &SocketAddr,
-    buf: String,
-    count: usize,
-) -> Result<usize, std::io::Error> {
-    let data = buf.as_bytes();
-    let mut v = vec![];
-
-    for _i in 0..count {
-        v.push(socket.send_to(&data, addr).await);
-    }
-
-    match v.foldr() {
-        Ok(sizes) => Ok(**sizes.iter().max().unwrap()),
-        Err(e) => Err(std::io::Error::from_raw_os_error(e.raw_os_error().unwrap())),
-    }
-}
-
-/**
- * TODO:
- *  - add a way to set the mod player, the player (or players) that can
- *    change game settings before the game starts
- *  - add endpoints to change game settings (map, game type, )
- *  - add support for password-protected servers (add authentication on login)
- *  - change the way map download works: if we use the authentication header for
- *    password-protected servers, we need to find another way to download maps:
- *    a good idea will be send the map anyway, but add support for encryption
- *    in the terrain file itself
- *  - add a basic chat protocol, maybe websockets or BOSH (BOSH seems easier).
- *    We MIGHT use XMPP in the future, especially if we use voice chats, but
- *    for now, a simple chat protocol will be used
- *  - a basic game protocol. We receive the inputs from a single client and send
- *    it to other clients each tick. The in-game protocol will probably be
- *    based on flatbuffers messages.
+ *  - /login [POST]: Get the login token
+ *  - /info [GET]:  Get the server info (name, max players, connected players)
+ *  - /clients/<id> [GET]: Get more information about a specific client
+ *  - /chat [GET]: Load the chat websocket
+ *
+ *  - /start [POST]: Request a match start
+ *  - /connect [POST]: Start the match, and forward the client to the
+ *                     port of the game server itself
+ *
+ * We do it on HTTP because it would be easier to use existing
+ * protocols than create a new
+ * Also, the chat websocket is the only endpoint that works after a game
+ * start
+ *
+ * TODO: how an spectator will connect?
  */
 
-// TODO: the server host (the admin mod) will be the first one that guesses
-// the host password
+
+async fn run_http_server(config: &ServerConfiguration) {
+
+    let login = warp::post()
+        .and(warp::path("login"))
+        .map(|| "Logging in");
+        
+
+    let test = warp::get()
+        .and(warp::path("test"))
+        .map(|| "Hello world!");
+
+    let clients = warp::get()
+        .and(warp::path!("clients" / u64)).map(
+            |cid| format!("Getting client {}", cid));
+
+        
+    
+    let server = warp::serve(login.or(test).or(clients));
+
+    println!("Server started at 127.0.0.1:{}", config.port);
+
+    server.run(([127, 0, 0, 1], config.port)).await;
+
+    println!("Server is shutting down")
+}
 
 #[tokio::main]
 async fn main() {
-    let addr = "0.0.0.0:6142";
-    let mut listener = TcpListener::bind(addr).await.unwrap();
+    println!("Starting Familyline server");
 
-    // The main loop for the HTTP part of the protocol
-    // Here we convert the `TcpListener` to a stream of incoming connections
-    // with the `incoming` method.
-    let server = async move {
-        let mut incoming = listener.incoming();
-        while let Some(conn) = incoming.next().await {
-            process_client(&gstate, conn).await;
-        }
-    };
+    let config = ServerConfiguration::load();
 
-    println!("Server address is {}", request::find_local_address());
-    println!("Server running on localhost:6142");
-
-    // Add a socket that will be used by clients so they can discover
-    // the server. We use UDP so we can simply multicast a search message
-    // and then the server will receive it and send the appropriate info
-    // to the client.
-    // We will use a VERY limited subset of SSDP, basically just the
-    // M-SEARCH message. For this reason, we bind the server to another
-    // port.
-    let mut udp_discover = UdpSocket::bind("0.0.0.0:1983").await.unwrap();
-    tokio::spawn(async move {
-        udp_discover
-            .join_multicast_v4(
-                "239.255.255.250".parse().unwrap(),
-                "0.0.0.0".parse().unwrap(),
-            )
-            .unwrap();
-        println!("Server is discoverable");
-        loop {
-            let mut buf = vec![0; 1024];
-            match udp_discover.recv_from(&mut buf).await {
-                Ok((msize, sockaddr)) => {
-                    let msg = match String::from_utf8(buf) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            format!("{:?} ({:?})", e.as_bytes(), e.utf8_error());
-                            "".to_string()
-                        }
-                    };
-
-                    let res = request::parse_discover_message(
-                        msg,
-                        &ServerDiscoveryInfo::from(&gstate.read().unwrap().info),
-                    );
-                    if let Some(response) = res {
-                        match send_multiple(&mut udp_discover, &sockaddr, response.clone(), 2).await
-                        {
-                            Ok(ssize) => {
-                                println!("{:?}, {} bytes\n V \n{}", sockaddr, ssize, response);
-                            }
-                            Err(e) => {
-                                eprintln!("{:?}", e);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    eprintln!("An error happened while receiving a message on the listen socket")
-                }
-            }
-        }
-    });
-
-    // Start the server and block this async fn until `server` spins down.
-    server.await;
+    run_http_server(&config).await;
 }
