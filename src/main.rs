@@ -9,13 +9,16 @@ use warp::{
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 
+mod broadcast;
+mod config;
 mod messages;
 
-use messages::ServerConfiguration;
+use config::ServerConfiguration;
+
+use messages::QueryError;
 use messages::{send_get_client_message, send_info_message, send_login_message};
 use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
-use messages::{QueryError};
-
+use broadcast::run_discovery_thread;
 /**
  * Our endpoints
  *
@@ -97,7 +100,7 @@ async fn serve_info(
                 }),
                 StatusCode::UNAUTHORIZED,
             )),
-            _ => panic!("Unhandled case!!!")
+            _ => panic!("Unhandled case!!!"),
         },
     }
 }
@@ -126,7 +129,7 @@ async fn serve_client(
                     message: String::from("Invalid token"),
                 }),
                 StatusCode::UNAUTHORIZED,
-            ))
+            )),
         },
     }
 }
@@ -176,5 +179,6 @@ async fn main() {
     let config = ServerConfiguration::load();
 
     let sender = create_request_channel(&config);
+    run_discovery_thread(&config, sender.clone()).await;
     run_http_server(&config, sender).await;
 }

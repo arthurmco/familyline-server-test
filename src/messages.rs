@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::config::ServerConfiguration;
+
 ///////
 
 struct FClient {
@@ -35,10 +37,10 @@ struct FServer {
 }
 
 impl FServer {
-    fn new(_config: &ServerConfiguration) -> FServer {
+    fn new(config: &ServerConfiguration) -> FServer {
         FServer {
             clients: vec![],
-            name: format!("Test server"),
+            name: config.name.clone(),
         }
     }
 
@@ -150,6 +152,7 @@ pub enum FRequestMessage {
     ValidateLogin(LoginInfo),
 
     GetServerInfo,
+    GetClientCount,
     GetClientInfo(u64),
 
     SendMessage(ChatReceiver, String),
@@ -162,24 +165,10 @@ pub enum FResponseMessage {
 
     GetServerInfo(ServerInfo),
     GetClientInfo(Option<ClientInfo>),
+    GetClientCount(usize),
 }
 
 pub type FMessage = (FRequestMessage, oneshot::Sender<FResponseMessage>);
-
-////////////
-
-#[derive(Copy, Clone)]
-pub struct ServerConfiguration {
-    pub port: u16,
-}
-
-impl ServerConfiguration {
-    pub fn load() -> ServerConfiguration {
-        ServerConfiguration { port: 8100 }
-    }
-}
-
-///////////
 
 /// Open a request channel
 ///
@@ -218,8 +207,13 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                 }
                 FRequestMessage::GetClientInfo(cid) => {
                     response.send(FResponseMessage::GetClientInfo(
-                        server.get_client(cid).and_then(|c| Some(ClientInfo::from(c)))
+                        server
+                            .get_client(cid)
+                            .and_then(|c| Some(ClientInfo::from(c))),
                     ));
+                }
+                FRequestMessage::GetClientCount => {
+                    response.send(FResponseMessage::GetClientCount(server.clients.len()));
                 }
                 _ => panic!("Unsupported message {:?}", cmd),
             };
@@ -269,6 +263,25 @@ pub async fn send_validate_login_message(
 
     if let FResponseMessage::ValidateLogin(res) = res {
         res
+    } else {
+        panic!("Unexpected response while trying to login");
+    }
+}
+
+pub async fn send_client_count_message(
+    sender: &mut Sender<FMessage>,
+) -> Result<usize, QueryError> {
+    let (resp_tx, resp_rx) = oneshot::channel();
+
+    sender
+        .send((FRequestMessage::GetClientCount, resp_tx))
+        .await
+        .ok()
+        .unwrap();
+    let res = resp_rx.await.unwrap();
+
+    if let FResponseMessage::GetClientCount(res) = res {
+        Ok(res)
     } else {
         panic!("Unexpected response while trying to login");
     }
