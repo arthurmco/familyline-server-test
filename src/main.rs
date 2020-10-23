@@ -12,9 +12,9 @@ use tokio::sync::oneshot;
 mod messages;
 
 use messages::ServerConfiguration;
-use messages::ValidateLoginError;
-use messages::{send_info_message, send_login_message};
+use messages::{send_get_client_message, send_info_message, send_login_message};
 use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
+use messages::{QueryError};
 
 /**
  * Our endpoints
@@ -91,12 +91,42 @@ async fn serve_info(
             StatusCode::OK,
         )),
         Err(e) => match e {
-            ValidateLoginError::InvalidToken => Ok(warp::reply::with_status(
+            QueryError::InvalidToken => Ok(warp::reply::with_status(
                 warp::reply::json(&BasicError {
                     message: String::from("Invalid token"),
                 }),
                 StatusCode::UNAUTHORIZED,
             )),
+            _ => panic!("Unhandled case!!!")
+        },
+    }
+}
+
+async fn serve_client(
+    clientid: u64,
+    body: AuthBody,
+    sender: Sender<FMessage>,
+) -> Result<impl warp::Reply, Infallible> {
+    let mut sender = sender.clone();
+
+    match send_get_client_message(&mut sender, &body.token, clientid).await {
+        Ok(cinfo) => Ok(warp::reply::with_status(
+            warp::reply::json(&cinfo),
+            StatusCode::OK,
+        )),
+        Err(e) => match e {
+            QueryError::ClientNotFound => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Client not found"),
+                }),
+                StatusCode::NOT_FOUND,
+            )),
+            QueryError::InvalidToken => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Invalid token"),
+                }),
+                StatusCode::UNAUTHORIZED,
+            ))
         },
     }
 }
@@ -123,13 +153,14 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
         .and(with_sender(sender.clone()))
         .and_then(serve_info);
 
-    let test = warp::get().and(warp::path("test")).map(|| "Hello world!");
-
-    let clients = warp::get()
+    let clients = warp::post()
         .and(warp::path!("clients" / u64))
-        .map(|cid| format!("Getting client {}", cid));
+        .and(warp::body::content_length_limit(1024))
+        .and(warp::body::json())
+        .and(with_sender(sender.clone()))
+        .and_then(serve_client);
 
-    let server = warp::serve(login.or(info).or(test).or(clients));
+    let server = warp::serve(login.or(info).or(clients));
 
     println!("Server started at 127.0.0.1:{}", config.port);
 

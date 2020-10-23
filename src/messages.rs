@@ -55,6 +55,12 @@ impl FServer {
     fn validate_token(&self, token: &str) -> Option<&FClient> {
         self.clients.iter().find(|c| c.token == token)
     }
+
+    /// Gets a Some(Client) if a client exists with the
+    /// specified ID, or return None
+    fn get_client(&self, client_id: u64) -> Option<&FClient> {
+        self.clients.iter().find(|c| c.id == client_id)
+    }
 }
 
 ////////
@@ -78,10 +84,10 @@ pub struct ChatMessage {
 /// generate the token
 pub enum LoginError {}
 
-/// Errors that can happen if you try to authenticate
-/// with your token
-pub enum ValidateLoginError {
+/// General Errors
+pub enum QueryError {
     InvalidToken,
+    ClientNotFound,
 }
 
 #[derive(Debug)]
@@ -152,9 +158,10 @@ pub enum FRequestMessage {
 
 pub enum FResponseMessage {
     Login(Result<LoginResult, LoginError>),
-    ValidateLogin(Result<LoginResult, ValidateLoginError>),
+    ValidateLogin(Result<LoginResult, QueryError>),
 
     GetServerInfo(ServerInfo),
+    GetClientInfo(Option<ClientInfo>),
 }
 
 pub type FMessage = (FRequestMessage, oneshot::Sender<FResponseMessage>);
@@ -202,12 +209,17 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                     }
                     None => {
                         response.send(FResponseMessage::ValidateLogin(Err(
-                            ValidateLoginError::InvalidToken,
+                            QueryError::InvalidToken,
                         )));
                     }
                 },
                 FRequestMessage::GetServerInfo => {
                     response.send(FResponseMessage::GetServerInfo(ServerInfo::from(&server)));
+                }
+                FRequestMessage::GetClientInfo(cid) => {
+                    response.send(FResponseMessage::GetClientInfo(
+                        server.get_client(cid).and_then(|c| Some(ClientInfo::from(c)))
+                    ));
                 }
                 _ => panic!("Unsupported message {:?}", cmd),
             };
@@ -240,7 +252,7 @@ pub async fn send_login_message(
 pub async fn send_validate_login_message(
     sender: &mut Sender<FMessage>,
     token: &str,
-) -> Result<LoginResult, ValidateLoginError> {
+) -> Result<LoginResult, QueryError> {
     let (resp_tx, resp_rx) = oneshot::channel();
 
     sender
@@ -265,7 +277,7 @@ pub async fn send_validate_login_message(
 pub async fn send_info_message(
     sender: &mut Sender<FMessage>,
     token: &str,
-) -> Result<ServerInfo, ValidateLoginError> {
+) -> Result<ServerInfo, QueryError> {
     match send_validate_login_message(sender, &token).await {
         Ok(login) => {
             let (resp_tx, resp_rx) = oneshot::channel();
@@ -279,6 +291,35 @@ pub async fn send_info_message(
 
             if let FResponseMessage::GetServerInfo(res) = res {
                 Ok(res)
+            } else {
+                panic!("Unexpected response while trying to login");
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn send_get_client_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+    client_id: u64,
+) -> Result<ClientInfo, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(login) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((FRequestMessage::GetClientInfo(client_id), resp_tx))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::GetClientInfo(res) = res {
+                match res {
+                    Some(c) => Ok(c),
+                    None => Err(QueryError::ClientNotFound),
+                }
             } else {
                 panic!("Unexpected response while trying to login");
             }
