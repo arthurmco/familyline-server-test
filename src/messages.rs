@@ -2,18 +2,39 @@ use rand::Rng;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 
+use crate::config::ServerConfiguration;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
-use crate::config::ServerConfiguration;
+use chrono::{offset::Utc, DateTime};
 
 ///////
+
+#[derive(Debug, Clone)]
+pub enum ChatReceiver {
+    All,
+    Team,
+    Client(u64),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    sender_id: u64,
+    receiver: ChatReceiver,
+    content: String,
+    store_date: DateTime<Utc>,
+}
 
 struct FClient {
     name: String,
     id: u64,
     token: String,
+
+    last_receive_sent_request: DateTime<Utc>,
+    send_queue: VecDeque<ChatMessage>,
+    receive_queue: VecDeque<ChatMessage>,
 }
 
 impl FClient {
@@ -27,7 +48,35 @@ impl FClient {
         tokenbase.hash(&mut s);
         let token = format!("{:016x}", s.finish());
 
-        FClient { name, id, token }
+        FClient {
+            name,
+            id,
+            token,
+            send_queue: VecDeque::new(),
+            receive_queue: VecDeque::new(),
+            last_receive_sent_request: Utc::now(),
+        }
+    }
+
+    fn send_message(&mut self, sender_id: u64, receiver: ChatReceiver, content: String) {
+        self.send_queue.push_back(ChatMessage {
+            sender_id,
+            receiver,
+            content,
+            store_date: Utc::now(),
+        });
+    }
+
+    fn get_received_messages(&self) -> Vec<ChatMessage> {
+        self.receive_queue
+            .iter()
+            .filter(|m| m.store_date >= self.last_receive_sent_request)
+            .map(|m| m.clone())
+            .collect()
+    }
+
+    fn register_message_receiving(&mut self) {
+        self.last_receive_sent_request = Utc::now();
     }
 }
 
@@ -63,22 +112,23 @@ impl FServer {
     fn get_client(&self, client_id: u64) -> Option<&FClient> {
         self.clients.iter().find(|c| c.id == client_id)
     }
+
+    fn get_client_mut(&mut self, client_id: u64) -> Option<&mut FClient> {
+        self.clients.iter_mut().find(|c| c.id == client_id)
+    }
+
+    fn get_client_id_from_token(&self, token: &str) -> Option<u64> {
+        self.clients.iter().find(|c| c.token == token).map(|c| c.id)
+    }
+
+    fn send_message_to_all(&mut self, sender_id: u64, content: String) {
+        self.clients.iter_mut().for_each(|c| {
+            c.send_message(sender_id, ChatReceiver::All, content.clone());
+        })
+    }
 }
 
 ////////
-
-#[derive(Debug)]
-pub enum ChatReceiver {
-    All,
-    Team(u32),
-    Client(u64),
-}
-
-#[derive(Debug)]
-pub struct ChatMessage {
-    sender_id: u64,
-    content: String,
-}
 
 ///////////
 
@@ -150,22 +200,27 @@ impl From<&FServer> for ServerInfo {
 pub enum FRequestMessage {
     Login(String),
     ValidateLogin(LoginInfo),
+    LogOff(LoginInfo),
 
     GetServerInfo,
     GetClientCount,
     GetClientInfo(u64),
 
-    SendMessage(ChatReceiver, String),
-    ReceiveMessages(Vec<ChatMessage>),
+    SendMessage(String, ChatReceiver, String),
+    ReceiveMessages(String),
 }
 
 pub enum FResponseMessage {
     Login(Result<LoginResult, LoginError>),
     ValidateLogin(Result<LoginResult, QueryError>),
+    LogOff(Option<u64>),
 
     GetServerInfo(ServerInfo),
     GetClientInfo(Option<ClientInfo>),
     GetClientCount(usize),
+
+    SendMessage,
+    ReceiveMessages(Vec<ChatMessage>),
 }
 
 pub type FMessage = (FRequestMessage, oneshot::Sender<FResponseMessage>);
@@ -215,6 +270,36 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                 FRequestMessage::GetClientCount => {
                     response.send(FResponseMessage::GetClientCount(server.clients.len()));
                 }
+                FRequestMessage::SendMessage(sender_token, receiver, content) => {
+                    let sender = server.get_client_id_from_token(&sender_token).unwrap();
+
+                    match receiver {
+                        ChatReceiver::All => {}
+                        ChatReceiver::Team => {
+                            unimplemented!();
+                        }
+                        ChatReceiver::Client(id) => {
+                            server.get_client_mut(id).and_then(|c| {
+                                c.send_message(sender, ChatReceiver::Client(id), content);
+                                Some(c)
+                            });
+                        }
+                    }
+
+                    response.send(FResponseMessage::SendMessage);
+                }
+                FRequestMessage::ReceiveMessages(sender_token) => {
+                    let client_id = server.get_client_id_from_token(&sender_token).unwrap();
+                    match server.get_client_mut(client_id) {
+                        Some(client) => {
+                            let msgs = client.get_received_messages();
+                            client.register_message_receiving();
+                            response.send(FResponseMessage::ReceiveMessages(msgs));
+                        }
+                        None => panic!("no client"),
+                    }
+                }
+
                 _ => panic!("Unsupported message {:?}", cmd),
             };
         }
@@ -268,9 +353,7 @@ pub async fn send_validate_login_message(
     }
 }
 
-pub async fn send_client_count_message(
-    sender: &mut Sender<FMessage>,
-) -> Result<usize, QueryError> {
+pub async fn send_client_count_message(sender: &mut Sender<FMessage>) -> Result<usize, QueryError> {
     let (resp_tx, resp_rx) = oneshot::channel();
 
     sender

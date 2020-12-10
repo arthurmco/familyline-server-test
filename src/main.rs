@@ -1,13 +1,19 @@
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use warp::{
     http::{Response, StatusCode},
+    ws::WebSocket,
     Filter,
 };
 
-use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
+use tokio::{
+    sync::mpsc::{channel, Receiver, Sender},
+    time,
+};
 
 mod broadcast;
 mod config;
@@ -15,10 +21,11 @@ mod messages;
 
 use config::ServerConfiguration;
 
+use broadcast::run_discovery_thread;
 use messages::QueryError;
 use messages::{send_get_client_message, send_info_message, send_login_message};
 use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
-use broadcast::run_discovery_thread;
+use std::time::Duration;
 /**
  * Our endpoints
  *
@@ -140,6 +147,82 @@ fn with_sender(
     warp::any().map(move || sender.clone())
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatMessageBody {
+    receiver: String,
+    content: String,
+}
+
+async fn send_chat_message(c: ChatMessageBody, token: &str) {}
+
+async fn handle_chat(ws: WebSocket) {
+    let (mut tx, mut rx) = ws.split();
+    let mut token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    println!("???");
+
+    // We need to send messages in a separate thread because, for some reason,
+    // warp and Rust streams has no easy way to get a non-blocking read
+    let stoken = Arc::clone(&token);
+    tokio::spawn(async move {
+        loop {
+            let token = Arc::clone(&stoken);
+            if token.lock().unwrap().is_some() {
+                println!("sending messages");
+                tokio::time::delay_for(Duration::from_millis(900)).await
+            }
+        }
+    });
+
+    loop {
+        let token = Arc::clone(&token);
+
+        match rx.try_next().await {
+            Ok(result) => match result {
+                Some(result) => {
+                    // First, we authenticate
+                    //
+                    // The client needs to send its token to the server
+                    if token.lock().unwrap().is_none() {
+                        let msg = result;
+                        let msgstr = msg.to_str().unwrap_or_default();
+                        let auth: Option<AuthBody> = serde_json::from_str(msgstr).ok();
+                        *token.lock().unwrap() = match auth {
+                            Some(auth) => Some(auth.token),
+                            None => None,
+                        };
+                    } else {
+                        let utoken = token.lock().unwrap();
+                        let vtoken = match *utoken {
+                            Some(ref v) => v.clone(),
+                            None => String::default(),
+                        };
+
+                        let msg = result;
+                        match msg.to_str() {
+                            Ok(msg) => {
+                                let cmsg: Option<ChatMessageBody> = serde_json::from_str(msg).ok();
+                                match cmsg {
+                                    Some(cmsg) => send_chat_message(cmsg, &vtoken),
+                                    None => continue,
+                                }
+                            }
+                            Err(_) => continue,
+                        };
+                    }
+                }
+                None => {
+                    println!("e");
+                }
+            },
+            Err(_) => {
+                println!("error?");
+                /// no message will be received
+                ()
+            }
+        }
+    }
+}
+
 /// Setup and run the HTTP login server
 async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>) {
     let login = warp::post()
@@ -163,7 +246,11 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
         .and(with_sender(sender.clone()))
         .and_then(serve_client);
 
-    let server = warp::serve(login.or(info).or(clients));
+    let chat = warp::path("chat")
+        .and(warp::ws())
+        .map(|ws: warp::ws::Ws| ws.on_upgrade(move |websocket| handle_chat(websocket)));
+
+    let server = warp::serve(login.or(info).or(clients).or(chat));
 
     println!("Server started at 127.0.0.1:{}", config.port);
 

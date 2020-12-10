@@ -9,10 +9,10 @@ use crate::config::ServerConfiguration;
 use crate::messages::{send_client_count_message, FMessage};
 use chrono::prelude::*;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Sender;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use std::net::{Ipv4Addr, SocketAddr};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::prelude::*;
+use tokio::sync::mpsc::Sender;
 
 use vecfold::VecFoldResult;
 
@@ -89,7 +89,7 @@ async fn create_discovery_response(
     sender: &Sender<FMessage>,
 ) -> DiscoveryResponse {
     let mut sender = sender.clone();
-    
+
     match send_client_count_message(&mut sender).await {
         Ok(num_clients) => DiscoveryResponse {
             name: c.name.clone(),
@@ -112,7 +112,6 @@ fn parse_discover_message(s: String, sres: DiscoveryResponse) -> Option<String> 
     let mut valid_method = false;
 
     for line in s.split("\r\n") {
-
         if line.starts_with("M-SEARCH *") {
             op = Some(DiscoverOperation::Search);
         }
