@@ -23,7 +23,7 @@ use config::ServerConfiguration;
 
 use broadcast::run_discovery_thread;
 use messages::QueryError;
-use messages::{send_get_client_message, send_info_message, send_login_message};
+use messages::{send_get_client_message, send_info_message, send_login_message, send_logout_message};
 use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
 use std::time::Duration;
 /**
@@ -69,6 +69,11 @@ struct BasicError {
     message: String,
 }
 
+#[derive(Deserialize, Serialize)]
+struct LogoutBody {
+    id: u64,
+}
+
 async fn serve_login(
     body: LoginBody,
     sender: Sender<FMessage>,
@@ -98,6 +103,29 @@ async fn serve_info(
     match send_info_message(&mut sender, &body.token).await {
         Ok(sinfo) => Ok(warp::reply::with_status(
             warp::reply::json(&sinfo),
+            StatusCode::OK,
+        )),
+        Err(e) => match e {
+            QueryError::InvalidToken => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Invalid token"),
+                }),
+                StatusCode::UNAUTHORIZED,
+            )),
+            _ => panic!("Unhandled case!!!"),
+        },
+    }
+}
+
+async fn serve_logout(
+    body: AuthBody,
+    sender: Sender<FMessage>,
+) -> Result<impl warp::Reply, Infallible> {
+    let mut sender = sender.clone();
+
+    match send_logout_message(&mut sender, &body.token).await {
+        Ok(id) => Ok(warp::reply::with_status(
+            warp::reply::json(&LogoutBody{id}),
             StatusCode::OK,
         )),
         Err(e) => match e {
@@ -155,7 +183,7 @@ pub struct ChatMessageBody {
 
 async fn send_chat_message(c: ChatMessageBody, token: &str) {}
 
-async fn handle_chat(ws: WebSocket) {
+async fn handle_chat(ws: WebSocket, sender: Sender<FMessage>) {
     let (mut tx, mut rx) = ws.split();
     let mut token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     println!("???");
@@ -232,6 +260,13 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
         .and(with_sender(sender.clone()))
         .and_then(serve_login);
 
+    let logout = warp::post()
+        .and(warp::path("logout"))
+        .and(warp::body::content_length_limit(1024))
+        .and(warp::body::json())
+        .and(with_sender(sender.clone()))
+        .and_then(serve_logout);
+
     let info = warp::post()
         .and(warp::path("info"))
         .and(warp::body::content_length_limit(1024))
@@ -247,14 +282,16 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
         .and_then(serve_client);
 
     let chat = warp::path("chat")
+        .and(with_sender(sender.clone()))
         .and(warp::ws())
-        .map(|ws: warp::ws::Ws| ws.on_upgrade(move |websocket| handle_chat(websocket)));
+        .map(|sender: Sender<FMessage>, ws: warp::ws::Ws| ws.on_upgrade(move |websocket| 
+            handle_chat(websocket, sender.clone())));
 
-    let server = warp::serve(login.or(info).or(clients).or(chat));
+    let server = warp::serve(login.or(info).or(logout).or(clients).or(chat));
 
     println!("Server started at 127.0.0.1:{}", config.port);
 
-    server.run(([127, 0, 0, 1], config.port)).await;
+    server.run(([0, 0, 0, 0], config.port)).await;
 
     println!("Server is shutting down")
 }

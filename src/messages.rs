@@ -58,6 +58,8 @@ impl FClient {
         }
     }
 
+    fn id(&self) -> u64 { self.id }
+
     fn send_message(&mut self, sender_id: u64, receiver: ChatReceiver, content: String) {
         self.send_queue.push_back(ChatMessage {
             sender_id,
@@ -97,6 +99,22 @@ impl FServer {
     fn add_client(&mut self, c: FClient) -> &FClient {
         self.clients.push(c);
         self.clients.last().unwrap()
+    }
+
+    /// Remove a client from the server database
+    /// 
+    /// Returns its ID if it existed, None if it did not.
+    fn remove_client(&mut self, id: u64) -> Option<u64> {
+        
+        let idx = self.clients.iter().enumerate().find(|&(idx, v)| v.id == id);
+
+        match idx {
+            Some((vidx, _)) => {
+                let v = self.clients.remove(vidx);
+                Some(v.id)
+            },
+            None => None
+        }
     }
 
     /// Check what user do this token belongs
@@ -200,7 +218,7 @@ impl From<&FServer> for ServerInfo {
 pub enum FRequestMessage {
     Login(String),
     ValidateLogin(LoginInfo),
-    LogOff(LoginInfo),
+    LogOff(String),
 
     GetServerInfo,
     GetClientCount,
@@ -244,7 +262,19 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
 
                     response.send(FResponseMessage::Login(Ok(LoginResult::from(client))));
                 }
-
+                FRequestMessage::LogOff(token) => match server.validate_token(&token) {
+                    Some(client) => {
+                        let cid = client.id();
+                        match server.remove_client(client.id()) {
+                            Some(id) => response.send(FResponseMessage::LogOff(Some(cid))),
+                            None => response.send(FResponseMessage::LogOff(None))
+                        };
+                        
+                    }
+                    None => {
+                        response.send(FResponseMessage::LogOff(None));
+                    }
+                },
                 FRequestMessage::ValidateLogin(info) => match server.validate_token(&info.token) {
                     Some(client) => {
                         response.send(FResponseMessage::ValidateLogin(Ok(LoginResult::from(
@@ -394,6 +424,35 @@ pub async fn send_info_message(
         Err(e) => Err(e),
     }
 }
+
+pub async fn send_logout_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+) -> Result<u64, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(login) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((FRequestMessage::LogOff(String::from(token)), resp_tx))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::LogOff(res) = res {
+                match res {
+                    Some(val) => Ok(val),
+                    None => panic!("Invalid token!")
+                }
+            } else {
+                panic!("Unexpected response while trying to login");
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 
 pub async fn send_get_client_message(
     sender: &mut Sender<FMessage>,
