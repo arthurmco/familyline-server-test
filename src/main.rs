@@ -21,25 +21,26 @@ mod messages;
 
 use config::ServerConfiguration;
 
-use broadcast::run_discovery_thread;
+use broadcast::{run_discovery_thread, find_local_address};
 use messages::QueryError;
 use messages::{
-    send_get_client_message, send_info_message, send_login_message, send_logout_message,
+    send_connect_message, send_get_client_message, send_info_message, send_login_message,
+    send_logout_message, send_set_ready_message, send_unset_ready_message, ConnectInfo,
 };
-use messages::{send_set_ready_message, send_unset_ready_message};
 use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
 use std::time::Duration;
 /**
  * Our endpoints
  *
  *  - /login [POST]: Get the login token
- *  - /info [GET]:  Get the server info (name, max players, connected players)
- *  - /clients/<id> [GET]: Get more information about a specific client
+ *  - /info [POST]:  Get the server info (name, max players, connected players)
+ *  - /clients/<id> [POST]: Get more information about a specific client
  *  - /chat [GET]: Load the chat websocket
+ *  - /ready/set and /ready/unset [PUT]: Set the ready status of the client
  *
  *  - /start [POST]: Request a match start
- *  - /connect [POST]: Start the match, and forward the client to the
- *                     port of the game server itself
+ *  - /connect [POST]: Make the client start the match.
+ *                     The client start the match when it detects all other clients are ready.
  *
  * We do it on HTTP because it would be easier to use existing
  * protocols than create a new
@@ -168,6 +169,7 @@ async fn serve_client(
                 }),
                 StatusCode::UNAUTHORIZED,
             )),
+            _ => panic!("Unexpected error!"),
         },
     }
 }
@@ -180,18 +182,18 @@ async fn set_ready(
 
     match send_set_ready_message(&mut sender, &body.token).await {
         Ok(v) => match v {
-            true => Ok(
-                warp::reply::with_status(warp::reply::json(&BasicError {
+            true => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
                     message: String::default(),
                 }),
-                StatusCode::OK),
-            ),
-            false => Ok(
-                warp::reply::with_status(warp::reply::json(&BasicError {
+                StatusCode::OK,
+            )),
+            false => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
                     message: String::from("Invalid state change"),
                 }),
-                StatusCode::INTERNAL_SERVER_ERROR),
-            ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )),
         },
         Err(e) => match e {
             QueryError::ClientNotFound => Ok(warp::reply::with_status(
@@ -199,6 +201,45 @@ async fn set_ready(
                     message: String::from("Client not found"),
                 }),
                 StatusCode::NOT_FOUND,
+            )),
+            QueryError::InvalidToken => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Invalid token"),
+                }),
+                StatusCode::UNAUTHORIZED,
+            )),
+            _ => panic!("Unexpected error!"),
+        },
+    }
+}
+
+async fn serve_connect(
+    body: AuthBody,
+    sender: Sender<FMessage>,
+    config: ServerConfiguration,
+) -> Result<impl warp::Reply, Infallible> {
+    let mut sender = sender.clone();
+
+    match send_connect_message(&mut sender, &body.token).await {
+        Ok(v) => Ok(warp::reply::with_status(
+            warp::reply::json(&ConnectInfo {
+                address: find_local_address(),
+                port: config.gameport,
+            }),
+            StatusCode::OK,
+        )),
+        Err(e) => match e {
+            QueryError::ClientNotFound => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Client not found"),
+                }),
+                StatusCode::NOT_FOUND,
+            )),
+            QueryError::NotAllClientsReady => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Not all clients are ready!"),
+                }),
+                StatusCode::BAD_REQUEST,
             )),
             QueryError::InvalidToken => Ok(warp::reply::with_status(
                 warp::reply::json(&BasicError {
@@ -218,18 +259,18 @@ async fn unset_ready(
 
     match send_unset_ready_message(&mut sender, &body.token).await {
         Ok(v) => match v {
-            true => Ok(
-                warp::reply::with_status(warp::reply::json(&BasicError {
+            true => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
                     message: String::default(),
                 }),
-                StatusCode::OK)
-            ),
-            false => Ok(
-                warp::reply::with_status(warp::reply::json(&BasicError {
+                StatusCode::OK,
+            )),
+            false => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
                     message: String::from("Invalid state change"),
                 }),
-                StatusCode::INTERNAL_SERVER_ERROR)
-            ),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )),
         },
         Err(e) => match e {
             QueryError::ClientNotFound => Ok(warp::reply::with_status(
@@ -244,6 +285,7 @@ async fn unset_ready(
                 }),
                 StatusCode::UNAUTHORIZED,
             )),
+            _ => panic!("Unexpected error!"),
         },
     }
 }
@@ -252,6 +294,12 @@ fn with_sender(
     sender: Sender<FMessage>,
 ) -> impl Filter<Extract = (Sender<FMessage>,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || sender.clone())
+}
+
+fn with_config(
+    config: ServerConfiguration,
+) -> impl Filter<Extract = (ServerConfiguration,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || config.clone())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -360,6 +408,13 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
         .and(with_sender(sender.clone()))
         .and_then(serve_client);
 
+    let connect = warp::post()
+        .and(warp::path!("connect"))
+        .and(warp::body::content_length_limit(1024))
+        .and(warp::body::json())
+        .and(with_sender(sender.clone()))
+        .and(with_config(config.clone()))
+        .and_then(serve_connect);
 
     let setready = warp::put()
         .and(warp::path("set"))
@@ -391,6 +446,7 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
             .or(logout)
             .or(clients)
             .or(chat)
+            .or(connect)
             .or(ready),
     );
 
@@ -400,6 +456,7 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
 
     println!("Server is shutting down")
 }
+
 
 #[tokio::main]
 async fn main() {

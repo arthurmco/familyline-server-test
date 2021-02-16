@@ -188,6 +188,17 @@ impl FServer {
         }
     }
 
+    /// Is all clients ready to connect?
+    /// 
+    /// This means more than one client, and all clients ready
+    fn is_ready_to_connect(&self) -> bool {
+        if self.clients.len() < 2 {
+            false
+        } else {
+            self.clients.iter().all(|c| c.get_state() == ClientState::InReady)
+        }
+    }
+
     /// Check what user do this token belongs
     ///
     /// If it belongs to some user, return it
@@ -229,6 +240,9 @@ pub enum LoginError {}
 pub enum QueryError {
     InvalidToken,
     ClientNotFound,
+
+    /// You tried to call /connect, but not all clients were ready
+    NotAllClientsReady,
 }
 
 #[derive(Debug)]
@@ -281,6 +295,13 @@ pub struct ServerInfo {
     max_clients: usize,
 }
 
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ConnectInfo {
+    pub address: String,
+    pub port: u16
+}
+
 impl From<&FServer> for ServerInfo {
     fn from(s: &FServer) -> Self {
         ServerInfo {
@@ -304,6 +325,8 @@ pub enum FRequestMessage {
     SetReady(u64),
     UnsetReady(u64),
 
+    ConnectStart(String),
+
     SendMessage(String, ChatReceiver, String),
     ReceiveMessages(String),
 }
@@ -319,6 +342,8 @@ pub enum FResponseMessage {
 
     SetReady(bool),
     UnsetReady(bool),
+
+    ConnectStart(Result<ConnectInfo, QueryError>),
 
     SendMessage,
     ReceiveMessages(Vec<ChatMessage>),
@@ -385,6 +410,26 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                 FRequestMessage::UnsetReady(cid) => {
                     response.send(FResponseMessage::UnsetReady(server.unset_client_ready(cid)));
                 }
+                FRequestMessage::ConnectStart(token) => match server.validate_token(&token) {
+                    Some(client) => {
+                        if server.is_ready_to_connect() {
+                            response.send(FResponseMessage::ConnectStart(Ok(ConnectInfo {
+                                address: String::default(),
+                                port: 0
+                            })));
+                        } else {
+                            response.send(FResponseMessage::ConnectStart(Err(
+                                QueryError::NotAllClientsReady
+                            )));
+                        }
+
+                    }
+                    None => {
+                        response.send(FResponseMessage::ConnectStart(Err(
+                            QueryError::InvalidToken,
+                        )));
+                    }
+                },
                 FRequestMessage::GetClientCount => {
                     response.send(FResponseMessage::GetClientCount(server.clients.len()));
                 }
@@ -619,3 +664,29 @@ pub async fn send_unset_ready_message(
         Err(e) => Err(e),
     }
 }
+
+pub async fn send_connect_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+) -> Result<ConnectInfo, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(login) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((FRequestMessage::ConnectStart(String::from(token)), resp_tx))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::ConnectStart(res) = res {
+                res
+            } else {
+                panic!("Unexpected response while trying to login");
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+

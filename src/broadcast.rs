@@ -51,7 +51,7 @@ async fn send_multiple(
 /// multicast to tell the client where to connect to
 ///
 /// If no address is found, it falls back to the loopback address.
-fn find_local_address() -> String {
+pub fn find_local_address() -> String {
     for iface in datalink::interfaces()
         .iter()
         .filter(|i| i.ips.len() > 0)
