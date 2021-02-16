@@ -23,7 +23,10 @@ use config::ServerConfiguration;
 
 use broadcast::run_discovery_thread;
 use messages::QueryError;
-use messages::{send_get_client_message, send_info_message, send_login_message, send_logout_message};
+use messages::{
+    send_get_client_message, send_info_message, send_login_message, send_logout_message,
+};
+use messages::{send_set_ready_message, send_unset_ready_message};
 use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
 use std::time::Duration;
 /**
@@ -125,7 +128,7 @@ async fn serve_logout(
 
     match send_logout_message(&mut sender, &body.token).await {
         Ok(id) => Ok(warp::reply::with_status(
-            warp::reply::json(&LogoutBody{id}),
+            warp::reply::json(&LogoutBody { id }),
             StatusCode::OK,
         )),
         Err(e) => match e {
@@ -152,6 +155,82 @@ async fn serve_client(
             warp::reply::json(&cinfo),
             StatusCode::OK,
         )),
+        Err(e) => match e {
+            QueryError::ClientNotFound => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Client not found"),
+                }),
+                StatusCode::NOT_FOUND,
+            )),
+            QueryError::InvalidToken => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Invalid token"),
+                }),
+                StatusCode::UNAUTHORIZED,
+            )),
+        },
+    }
+}
+
+async fn set_ready(
+    body: AuthBody,
+    sender: Sender<FMessage>,
+) -> Result<impl warp::Reply, Infallible> {
+    let mut sender = sender.clone();
+
+    match send_set_ready_message(&mut sender, &body.token).await {
+        Ok(v) => match v {
+            true => Ok(
+                warp::reply::with_status(warp::reply::json(&BasicError {
+                    message: String::default(),
+                }),
+                StatusCode::OK),
+            ),
+            false => Ok(
+                warp::reply::with_status(warp::reply::json(&BasicError {
+                    message: String::from("Invalid state change"),
+                }),
+                StatusCode::INTERNAL_SERVER_ERROR),
+            ),
+        },
+        Err(e) => match e {
+            QueryError::ClientNotFound => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Client not found"),
+                }),
+                StatusCode::NOT_FOUND,
+            )),
+            QueryError::InvalidToken => Ok(warp::reply::with_status(
+                warp::reply::json(&BasicError {
+                    message: String::from("Invalid token"),
+                }),
+                StatusCode::UNAUTHORIZED,
+            )),
+        },
+    }
+}
+
+async fn unset_ready(
+    body: AuthBody,
+    sender: Sender<FMessage>,
+) -> Result<impl warp::Reply, Infallible> {
+    let mut sender = sender.clone();
+
+    match send_unset_ready_message(&mut sender, &body.token).await {
+        Ok(v) => match v {
+            true => Ok(
+                warp::reply::with_status(warp::reply::json(&BasicError {
+                    message: String::default(),
+                }),
+                StatusCode::OK)
+            ),
+            false => Ok(
+                warp::reply::with_status(warp::reply::json(&BasicError {
+                    message: String::from("Invalid state change"),
+                }),
+                StatusCode::INTERNAL_SERVER_ERROR)
+            ),
+        },
         Err(e) => match e {
             QueryError::ClientNotFound => Ok(warp::reply::with_status(
                 warp::reply::json(&BasicError {
@@ -281,13 +360,39 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
         .and(with_sender(sender.clone()))
         .and_then(serve_client);
 
+
+    let setready = warp::put()
+        .and(warp::path("set"))
+        .and(warp::body::json())
+        .and(with_sender(sender.clone()))
+        .and_then(set_ready);
+
+    let unsetready = warp::put()
+        .and(warp::path("unset"))
+        .and(warp::body::content_length_limit(1024))
+        .and(warp::body::json())
+        .and(with_sender(sender.clone()))
+        .and_then(unset_ready);
+
+    let ready = warp::path("ready")
+        .and(warp::body::content_length_limit(1024))
+        .and(setready.or(unsetready));
+
     let chat = warp::path("chat")
         .and(with_sender(sender.clone()))
         .and(warp::ws())
-        .map(|sender: Sender<FMessage>, ws: warp::ws::Ws| ws.on_upgrade(move |websocket| 
-            handle_chat(websocket, sender.clone())));
+        .map(|sender: Sender<FMessage>, ws: warp::ws::Ws| {
+            ws.on_upgrade(move |websocket| handle_chat(websocket, sender.clone()))
+        });
 
-    let server = warp::serve(login.or(info).or(logout).or(clients).or(chat));
+    let server = warp::serve(
+        login
+            .or(info)
+            .or(logout)
+            .or(clients)
+            .or(chat)
+            .or(ready),
+    );
 
     println!("Server started at 127.0.0.1:{}", config.port);
 

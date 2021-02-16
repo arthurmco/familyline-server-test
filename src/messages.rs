@@ -27,10 +27,27 @@ pub struct ChatMessage {
     store_date: DateTime<Utc>,
 }
 
+/// Client state
+#[derive(PartialEq, Copy, Clone)]
+enum ClientState {
+    /// Client just connected, it is in the game setup screen
+    InGameSetup,
+
+    /// Client is ready to start player
+    InReady,
+
+    /// All clients are ready, game is starting
+    InGameStart,
+
+    /// Client connected to the game socket; the game is started or already started
+    InGame,
+}
+
 struct FClient {
     name: String,
     id: u64,
     token: String,
+    state: ClientState,
 
     last_receive_sent_request: DateTime<Utc>,
     send_queue: VecDeque<ChatMessage>,
@@ -52,13 +69,16 @@ impl FClient {
             name,
             id,
             token,
+            state: ClientState::InGameSetup,
             send_queue: VecDeque::new(),
             receive_queue: VecDeque::new(),
             last_receive_sent_request: Utc::now(),
         }
     }
 
-    fn id(&self) -> u64 { self.id }
+    fn id(&self) -> u64 {
+        self.id
+    }
 
     fn send_message(&mut self, sender_id: u64, receiver: ChatReceiver, content: String) {
         self.send_queue.push_back(ChatMessage {
@@ -67,6 +87,38 @@ impl FClient {
             content,
             store_date: Utc::now(),
         });
+    }
+
+    fn get_state(&self) -> ClientState {
+        self.state
+    }
+
+    /// Notify that the client is ready
+    ///
+    /// Return true if the state change is valid, false if it is not.
+    fn set_ready(&mut self) -> bool {
+        let (nstate, ret) = match self.state {
+            ClientState::InReady => (ClientState::InReady, true),
+            ClientState::InGameSetup => (ClientState::InReady, true),
+            _ => (self.state, false),
+        };
+
+        self.state = nstate;
+        return ret;
+    }
+
+    /// Notify that the client is not ready anymore
+    ///
+    /// Return true if the state change is valid, false if it is not.
+    fn unset_ready(&mut self) -> bool {
+        let (nstate, ret) = match self.state {
+            ClientState::InReady => (ClientState::InGameSetup, true),
+            ClientState::InGameSetup => (ClientState::InGameSetup, true),
+            _ => (self.state, false),
+        };
+
+        self.state = nstate;
+        return ret;
     }
 
     fn get_received_messages(&self) -> Vec<ChatMessage> {
@@ -102,18 +154,37 @@ impl FServer {
     }
 
     /// Remove a client from the server database
-    /// 
+    ///
     /// Returns its ID if it existed, None if it did not.
     fn remove_client(&mut self, id: u64) -> Option<u64> {
-        
         let idx = self.clients.iter().enumerate().find(|&(idx, v)| v.id == id);
 
         match idx {
             Some((vidx, _)) => {
                 let v = self.clients.remove(vidx);
                 Some(v.id)
-            },
-            None => None
+            }
+            None => None,
+        }
+    }
+
+    /// Set a client ready.
+    ///
+    /// Return true if the set was successful, false if it was not
+    fn set_client_ready(&mut self, client_id: u64) -> bool {
+        match self.get_client_mut(client_id) {
+            Some(c) => c.set_ready(),
+            None => false,
+        }
+    }
+
+    /// Unet a client ready.
+    ///
+    /// Return true if the set was successful, false if it was not
+    fn unset_client_ready(&mut self, client_id: u64) -> bool {
+        match self.get_client_mut(client_id) {
+            Some(c) => c.unset_ready(),
+            None => false,
         }
     }
 
@@ -186,6 +257,9 @@ impl From<&FClient> for LoginResult {
 pub struct ClientInfo {
     name: String,
     user_id: u64,
+    ready: bool,
+    connecting: bool,
+    ingame: bool,
 }
 
 impl From<&FClient> for ClientInfo {
@@ -193,6 +267,9 @@ impl From<&FClient> for ClientInfo {
         ClientInfo {
             name: c.name.clone(),
             user_id: c.id,
+            ready: c.get_state() == ClientState::InReady,
+            connecting: c.get_state() == ClientState::InGameStart,
+            ingame: c.get_state() == ClientState::InGame,
         }
     }
 }
@@ -224,6 +301,9 @@ pub enum FRequestMessage {
     GetClientCount,
     GetClientInfo(u64),
 
+    SetReady(u64),
+    UnsetReady(u64),
+
     SendMessage(String, ChatReceiver, String),
     ReceiveMessages(String),
 }
@@ -236,6 +316,9 @@ pub enum FResponseMessage {
     GetServerInfo(ServerInfo),
     GetClientInfo(Option<ClientInfo>),
     GetClientCount(usize),
+
+    SetReady(bool),
+    UnsetReady(bool),
 
     SendMessage,
     ReceiveMessages(Vec<ChatMessage>),
@@ -267,9 +350,8 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                         let cid = client.id();
                         match server.remove_client(client.id()) {
                             Some(id) => response.send(FResponseMessage::LogOff(Some(cid))),
-                            None => response.send(FResponseMessage::LogOff(None))
+                            None => response.send(FResponseMessage::LogOff(None)),
                         };
-                        
                     }
                     None => {
                         response.send(FResponseMessage::LogOff(None));
@@ -296,6 +378,12 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                             .get_client(cid)
                             .and_then(|c| Some(ClientInfo::from(c))),
                     ));
+                }
+                FRequestMessage::SetReady(cid) => {
+                    response.send(FResponseMessage::SetReady(server.set_client_ready(cid)));
+                }
+                FRequestMessage::UnsetReady(cid) => {
+                    response.send(FResponseMessage::UnsetReady(server.unset_client_ready(cid)));
                 }
                 FRequestMessage::GetClientCount => {
                     response.send(FResponseMessage::GetClientCount(server.clients.len()));
@@ -443,7 +531,7 @@ pub async fn send_logout_message(
             if let FResponseMessage::LogOff(res) = res {
                 match res {
                     Some(val) => Ok(val),
-                    None => panic!("Invalid token!")
+                    None => panic!("Invalid token!"),
                 }
             } else {
                 panic!("Unexpected response while trying to login");
@@ -452,7 +540,6 @@ pub async fn send_logout_message(
         Err(e) => Err(e),
     }
 }
-
 
 pub async fn send_get_client_message(
     sender: &mut Sender<FMessage>,
@@ -475,6 +562,56 @@ pub async fn send_get_client_message(
                     Some(c) => Ok(c),
                     None => Err(QueryError::ClientNotFound),
                 }
+            } else {
+                panic!("Unexpected response while trying to login");
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn send_set_ready_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+) -> Result<bool, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(login) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((FRequestMessage::SetReady(login.user_id), resp_tx))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::SetReady(res) = res {
+                Ok(res)
+            } else {
+                panic!("Unexpected response while trying to login");
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn send_unset_ready_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+) -> Result<bool, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(login) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((FRequestMessage::UnsetReady(login.user_id), resp_tx))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::UnsetReady(res) = res {
+                Ok(res)
             } else {
                 panic!("Unexpected response while trying to login");
             }
