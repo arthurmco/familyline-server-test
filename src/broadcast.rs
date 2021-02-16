@@ -155,15 +155,16 @@ fn parse_discover_message(s: String, sres: DiscoveryResponse) -> Option<String> 
 
 pub async fn run_discovery_thread(config: &ServerConfiguration, sender: Sender<FMessage>) {
     let config = config.clone();
-    let mut udp_discover = UdpSocket::bind("0.0.0.0:1983").await.unwrap();
+    let laddr = find_local_address();
+    let mut udp_discover = UdpSocket::bind(format!("{}:1983", laddr)).await.unwrap();
     tokio::spawn(async move {
         udp_discover
             .join_multicast_v4(
                 "239.255.255.250".parse().unwrap(),
-                "0.0.0.0".parse().unwrap(),
+                laddr.parse().unwrap(),
             )
             .unwrap();
-        println!("Server is discoverable");
+        println!("Server is discoverable!");
         loop {
             let mut buf = vec![0; 1024];
             match udp_discover.recv_from(&mut buf).await {
@@ -180,11 +181,12 @@ pub async fn run_discovery_thread(config: &ServerConfiguration, sender: Sender<F
                         msg,
                         create_discovery_response(&config, &sender).await,
                     );
+
                     if let Some(response) = res {
                         match send_multiple(&mut udp_discover, &sockaddr, response.clone(), 2).await
                         {
                             Ok(ssize) => {
-                                println!("{:?}, {} bytes\n V \n{}", sockaddr, ssize, response);
+                                println!("{:?}, {} bytes", sockaddr, ssize);
                             }
                             Err(e) => {
                                 eprintln!("{:?}", e);
