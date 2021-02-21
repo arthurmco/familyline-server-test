@@ -1,0 +1,28 @@
+
+table StartRequest {
+    client_id: ulong;
+    token: string;    
+}
+
+table StartResponse {
+    client_ack: ulong;
+    all_clients_ack: bool;
+}
+
+union Message {
+    sreq: StartRequest,
+    sres: StartResponse,
+}
+
+table NetPacket {
+    tick: ulong;
+    source_client: ulong;
+    dest_client: ulong;
+    timestamp: ulong;
+    id: ulong;
+
+    message: Message (required);
+}
+
+
+root_type NetPacket;
