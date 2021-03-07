@@ -11,7 +11,7 @@ use warp::{
 
 use tokio::sync::oneshot;
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt, Interest},
     sync::mpsc::{channel, Receiver, Sender},
     time,
 };
@@ -325,7 +325,7 @@ async fn handle_chat(ws: WebSocket, sender: Sender<FMessage>) {
             let token = Arc::clone(&stoken);
             if token.lock().unwrap().is_some() {
                 println!("sending messages");
-                tokio::time::delay_for(Duration::from_millis(900)).await
+                tokio::time::sleep(Duration::from_millis(900)).await
             }
         }
     });
@@ -493,12 +493,11 @@ pub fn create_packet(packet: &NetPacket, builder: &flatbuffers::FlatBufferBuilde
     res.extend(&magic.as_bytes().to_vec());
     res.extend(&vec![0, 0, 0, 0]); // flags
     res.extend(&vec![0, 0, 0, 0]); // checksum (to be filled later)
-    res.extend(&vec![0, 0, 0, 0]); // payload size
     res.extend(&vec![
-        0,
-        (psize >> 16) as u8 & 0xff,
-        (psize >> 8) as u8 & 0xff,
         psize as u8 & 0xff,
+        (psize >> 8) as u8 & 0xff,
+        (psize >> 18) as u8 & 0xff,
+        0
     ]); // checksum (to be filled later)
     res.extend(payload);
 
@@ -526,18 +525,18 @@ pub fn decode_packet(packet: &[u8]) -> Option<NetPacket> {
         return None;
     }
 
-    let checksum = packet[11] as u32
-        | ((packet[10] as u32) << 8)
-        | ((packet[9] as u32) << 16)
-        | ((packet[8] as u32) << 24);
+    let checksum = packet[8] as u32
+        | ((packet[9] as u32) << 8)
+        | ((packet[10] as u32) << 16)
+        | ((packet[11] as u32) << 24);
     if checksum == 0 {
         return None;
     }
 
-    let psize = (packet[15] as u32
-        | ((packet[14] as u32) << 8)
-        | ((packet[13] as u32) << 16)
-        | ((packet[12] as u32) << 24)) as usize;
+    let psize = (packet[12] as u32
+        | ((packet[13] as u32) << 8)
+        | ((packet[14] as u32) << 16)
+        | ((packet[15] as u32) << 24)) as usize;
 
     if psize > packet.len() {
         return None;
@@ -565,32 +564,54 @@ pub async fn run_game_server_thread(config: &ServerConfiguration, sender: Sender
                 let mut size = [0u8; 1024];
                 let mut valid = true;
                 while valid {
-                    let data = match socket.read(&mut size[..]).await {
-                        Ok(s) => {
-                            if s == 0 {
-                                valid = false;
-                            }
-                            size[0..s].to_vec()
-                        },
-                        Err(e) => {
-                            eprintln!("Error while reading: {:?}", e);
-                            valid = false;
-                            vec![0]
-                        }
-                    };
+                    let ready = socket
+                        .ready(Interest::READABLE | Interest::WRITABLE)
+                        .await
+                        .unwrap();
 
-                    if !valid {
-                        break;
+                    if ready.is_readable() {
+                        let data = match socket.read(&mut size[..]).await {
+                            Ok(s) => {
+                                if s == 0 {
+                                    valid = false;
+                                }
+                                size[0..s].to_vec()
+                            }
+                            Err(e) => {
+                                eprintln!("Error while reading: {:?}", e);
+                                valid = false;
+                                vec![0]
+                            }
+                        };
+       
+                        if !valid {
+                            break;
+                        }
+
+                        let packet = decode_packet(&data[..]);
+                        println!("{:?}", packet);
                     }
 
-                    let packet = decode_packet(&data[..]);
-                    println!("{:?}", packet);
+                    if ready.is_writable() {
+                        let str = String::from("QUE BUNITA");
+                        match socket.write(str.as_bytes()).await {
+                            Ok(s) => {
+                                if s <= 0 { valid = false; }
+                                ()
+                            }
+                            Err(e) => {
+                                eprintln!("Error while writing: {:?}", e);
+                                valid = false;
+                                ()
+                            }
+                        }
+
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                    }
+
                 }
-   
                 println!("Client disconnected from: {}", peer.to_string());
             });
-
-
         }
     });
 }
