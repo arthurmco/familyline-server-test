@@ -1,11 +1,12 @@
-use std::hash::{Hash, Hasher};
+use rand::Rng;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
-use rand::Rng;
+use std::hash::{Hash, Hasher};
 
 use chrono::{offset::Utc, DateTime};
 
 use crate::config::ServerConfiguration;
+use crate::gamemsg::Packet;
 
 #[derive(Debug, Clone)]
 pub enum ChatReceiver {
@@ -31,6 +32,9 @@ pub enum ClientState {
     /// Client is ready to start player
     InReady,
 
+    /// Client connected to the game server
+    InGameConnect,
+
     /// All clients are ready, game is starting
     InGameStart,
 
@@ -47,6 +51,8 @@ pub struct FClient {
     last_receive_sent_request: DateTime<Utc>,
     send_queue: VecDeque<ChatMessage>,
     receive_queue: VecDeque<ChatMessage>,
+
+    game_packets: VecDeque<Packet>,
 }
 
 impl FClient {
@@ -68,6 +74,7 @@ impl FClient {
             send_queue: VecDeque::new(),
             receive_queue: VecDeque::new(),
             last_receive_sent_request: Utc::now(),
+            game_packets: VecDeque::new(),
         }
     }
 
@@ -82,6 +89,26 @@ impl FClient {
             content,
             store_date: Utc::now(),
         });
+    }
+
+    /// Push a game packet into this client queue
+    pub fn push_game_packet(&mut self, p: Packet) {
+        self.game_packets.push_back(p);
+    }
+
+    /// Peek a game packet from the top of the client queue
+    ///
+    /// If there is no game packet there, return None
+    pub fn peek_game_packet(&self) -> Option<&Packet> {
+        self.game_packets.front()
+    }
+
+    /// Remove the game packet that is in front of the client queue
+    ///
+    /// Returns the game packet that was there, or None if there was
+    /// no packet
+    pub fn pop_game_packet(&mut self) -> Option<Packet> {
+        self.game_packets.pop_front()
     }
 
     pub fn get_state(&self) -> ClientState {
@@ -109,6 +136,18 @@ impl FClient {
         let (nstate, ret) = match self.state {
             ClientState::InReady => (ClientState::InGameSetup, true),
             ClientState::InGameSetup => (ClientState::InGameSetup, true),
+            _ => (self.state, false),
+        };
+
+        self.state = nstate;
+        return ret;
+    }
+
+    /// Set the client to the connecting state
+    pub fn set_connect(&mut self) -> bool {
+        let (nstate, ret) = match self.state {
+            ClientState::InReady => (ClientState::InGameConnect, true),
+            ClientState::InGameConnect => (ClientState::InGameConnect, true),
             _ => (self.state, false),
         };
 
@@ -183,16 +222,58 @@ impl FServer {
         }
     }
 
+    /// Set a client to connect state
+    ///
+    /// Return true if the set was successful, false if it was not
+    pub fn set_client_connect(&mut self, client_id: u64) -> bool {
+        match self.get_client_mut(client_id) {
+            Some(c) => c.set_connect(),
+            None => false,
+        }
+    }
     /// Is all clients ready to connect?
-    /// 
+    ///
     /// This means more than one client, and all clients ready
     pub fn is_ready_to_connect(&self) -> bool {
         if self.clients.len() < 2 {
             false
         } else {
-            self.clients.iter().all(|c| c.get_state() == ClientState::InReady)
+            self.clients
+                .iter()
+                .all(|c| c.get_state() == ClientState::InReady)
         }
     }
+
+    /// Broadcast a message to all clients, unless the
+    /// client is the one who has the ID in the `exception_list`
+    pub fn broadcast_game_packet(&mut self, p: Packet, exception_list: Vec<u64>) {
+        self.clients
+            .iter_mut()
+            .filter(|c| !exception_list.contains(&c.id()))
+            .for_each(|c| c.push_game_packet(p.to_new_client(c.id())))
+    }
+
+
+    /// Pop a packet from a client
+    pub fn pop_game_packet(&mut self, client_id: u64) -> Option<Packet> {
+        match self.get_client_mut(client_id) {
+            Some(c) => c.pop_game_packet(),
+            None => None,
+        }
+    }
+
+    /// Return true if all clients are connected, i.e, all
+    /// clients called the /connect endpoint, and identified
+    /// themselves in the game server port.
+    pub fn all_clients_connected(&self) -> bool {
+        self.clients.iter().all(|c| match c.get_state() {
+            ClientState::InGameConnect => true,
+            ClientState::InGameStart => true,
+            ClientState::InGame => true,
+            _ => false,
+        })
+    }
+    
 
     /// Check what user do this token belongs
     ///

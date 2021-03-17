@@ -1,35 +1,33 @@
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use warp::{
-    http::{Response, StatusCode},
+    http::{StatusCode},
     ws::WebSocket,
     Filter,
 };
 
-use tokio::sync::oneshot;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, Interest},
-    sync::mpsc::{channel, Receiver, Sender},
-    time,
+    sync::mpsc::{Sender},
 };
 
 mod broadcast;
 mod client;
 mod config;
+mod gamemsg;
 mod messages;
 
 use config::ServerConfiguration;
 
 use broadcast::{find_local_address, run_discovery_thread};
+use gamemsg::run_game_server_thread;
 use messages::QueryError;
 use messages::{
     send_connect_message, send_get_client_message, send_info_message, send_login_message,
     send_logout_message, send_set_ready_message, send_unset_ready_message, ConnectInfo,
 };
-use messages::{start_message_processor, FMessage, FRequestMessage, FResponseMessage};
+use messages::{start_message_processor, FMessage};
 use std::time::Duration;
 /**
  * Our endpoints
@@ -457,163 +455,6 @@ async fn run_http_server(config: &ServerConfiguration, sender: Sender<FMessage>)
     server.run(([0, 0, 0, 0], config.port)).await;
 
     println!("Server is shutting down")
-}
-
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-
-extern crate flatbuffers;
-
-#[allow(dead_code, unused_imports)]
-#[path = "./network_generated.rs"]
-mod network_generated;
-pub use network_generated::{
-    get_root_as_net_packet, Message, NetPacket, StartRequest, StartResponse,
-};
-
-/// Create the network packet
-///
-/// It goes like this:
-///
-/// | Field        | Size | Description                               |
-/// | ------------ | ---- | ----------------------------------------- |
-/// | magic        | 4    | The magic header for the message          |
-/// | flags        | 4    | Some flags for the message. Currently 0   |
-/// | checksum     | 4    | The CRC32 checksum of the whole message   |
-/// | payloadsize  | 4    | Size of the payload, in bytes             |
-/// | payload      | n    | The payload                               |
-///
-/// Returns a vector with the binary data for the packet
-pub fn create_packet(packet: &NetPacket, builder: &flatbuffers::FlatBufferBuilder) -> Vec<u8> {
-    let magic = "FAMI";
-    // builder.finish(packet, None);
-    let payload = builder.finished_data();
-    let psize = payload.len();
-    let mut res = Vec::new();
-
-    res.extend(&magic.as_bytes().to_vec());
-    res.extend(&vec![0, 0, 0, 0]); // flags
-    res.extend(&vec![0, 0, 0, 0]); // checksum (to be filled later)
-    res.extend(&vec![
-        psize as u8 & 0xff,
-        (psize >> 8) as u8 & 0xff,
-        (psize >> 18) as u8 & 0xff,
-        0
-    ]); // checksum (to be filled later)
-    res.extend(payload);
-
-    res
-}
-
-/// Decode the network packet
-pub fn decode_packet(packet: &[u8]) -> Option<NetPacket> {
-    if packet.len() <= 16 {
-        return None;
-    }
-
-    let magic = match String::from_utf8(packet[0..4].to_vec()) {
-        Ok(s) => {
-            if s != "FAMI" {
-                return None;
-            } else {
-                s
-            }
-        }
-        Err(_) => return None, // Invalid message
-    };
-    let flags = packet[7] as u32 | ((packet[6] as u32) << 8) | ((packet[5] as u32) << 16);
-    if flags != 0 {
-        return None;
-    }
-
-    let checksum = packet[8] as u32
-        | ((packet[9] as u32) << 8)
-        | ((packet[10] as u32) << 16)
-        | ((packet[11] as u32) << 24);
-    if checksum == 0 {
-        return None;
-    }
-
-    let psize = (packet[12] as u32
-        | ((packet[13] as u32) << 8)
-        | ((packet[14] as u32) << 16)
-        | ((packet[15] as u32) << 24)) as usize;
-
-    if psize > packet.len() {
-        return None;
-    }
-
-    let payload = &packet[16..(psize - 16)];
-
-    Some(get_root_as_net_packet(&payload))
-}
-
-/// Run the game server thread
-///
-/// Even if you connect, the game server will only accept your messages and answer them if
-/// you call /connect and receive a positive answer
-pub async fn run_game_server_thread(config: &ServerConfiguration, sender: Sender<FMessage>) {
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", config.gameport)).await;
-    let mut listener = listener.unwrap();
-
-    println!("Game server started at port {}", config.gameport);
-    tokio::spawn(async move {
-        while let Ok((mut socket, peer)) = listener.accept().await {
-            tokio::spawn(async move {
-                println!("Client Connected from: {}", peer.to_string());
-
-                let mut size = [0u8; 1024];
-                let mut valid = true;
-                while valid {
-                    let ready = socket
-                        .ready(Interest::READABLE | Interest::WRITABLE)
-                        .await
-                        .unwrap();
-
-                    if ready.is_readable() {
-                        let data = match socket.read(&mut size[..]).await {
-                            Ok(s) => {
-                                if s == 0 {
-                                    valid = false;
-                                }
-                                size[0..s].to_vec()
-                            }
-                            Err(e) => {
-                                eprintln!("Error while reading: {:?}", e);
-                                valid = false;
-                                vec![0]
-                            }
-                        };
-       
-                        if !valid {
-                            break;
-                        }
-
-                        let packet = decode_packet(&data[..]);
-                        println!("{:?}", packet);
-                    }
-
-                    if ready.is_writable() {
-                        let str = String::from("QUE BUNITA");
-                        match socket.write(str.as_bytes()).await {
-                            Ok(s) => {
-                                if s <= 0 { valid = false; }
-                                ()
-                            }
-                            Err(e) => {
-                                eprintln!("Error while writing: {:?}", e);
-                                valid = false;
-                                ()
-                            }
-                        }
-
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
-                    }
-
-                }
-                println!("Client disconnected from: {}", peer.to_string());
-            });
-        }
-    });
 }
 
 #[tokio::main]

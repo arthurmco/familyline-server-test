@@ -1,11 +1,11 @@
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 
-use crate::config::ServerConfiguration;
-use serde::{Deserialize, Serialize};
-
 use crate::client::*;
-
+use crate::config::ServerConfiguration;
+use crate::gamemsg::{Packet, PacketMessage};
+use chrono::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// Errors that can happen if you try to login and
 /// generate the token
@@ -70,11 +70,10 @@ pub struct ServerInfo {
     max_clients: usize,
 }
 
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConnectInfo {
     pub address: String,
-    pub port: u16
+    pub port: u16,
 }
 
 impl From<&FServer> for ServerInfo {
@@ -104,6 +103,10 @@ pub enum FRequestMessage {
 
     SendMessage(String, ChatReceiver, String),
     ReceiveMessages(String),
+
+    ConnectConfirm(String),
+    PushGameMessage(String, Packet),
+    PopGameMessage(String),
 }
 
 pub enum FResponseMessage {
@@ -122,6 +125,10 @@ pub enum FResponseMessage {
 
     SendMessage,
     ReceiveMessages(Vec<ChatMessage>),
+
+    ConnectConfirm(Result<(), QueryError>),
+    PushGameMessage(),
+    PopGameMessage(Option<Packet>),
 }
 
 pub type FMessage = (FRequestMessage, oneshot::Sender<FResponseMessage>);
@@ -130,6 +137,12 @@ pub type FMessage = (FRequestMessage, oneshot::Sender<FResponseMessage>);
 ///
 /// Both the HTTP login API and the game server will use it
 /// to request data.
+///
+/// This function will receive all messages (the questions
+/// are defined on FRequestMessage) and answer them (the responses
+/// are defined on FResponseMessage). Both are a few lines above
+///
+/// It will become very big
 pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage> {
     let (tx, mut rx): (Sender<FMessage>, Receiver<FMessage>) = channel(100);
 
@@ -148,7 +161,7 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                 FRequestMessage::LogOff(token) => match server.validate_token(&token) {
                     Some(client) => {
                         let cid = client.id();
-                        match server.remove_client(client.id()) {
+                        match server.remove_client(cid) {
                             Some(id) => response.send(FResponseMessage::LogOff(Some(cid))),
                             None => response.send(FResponseMessage::LogOff(None)),
                         };
@@ -186,23 +199,58 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                     response.send(FResponseMessage::UnsetReady(server.unset_client_ready(cid)));
                 }
                 FRequestMessage::ConnectStart(token) => match server.validate_token(&token) {
-                    Some(client) => {
+                    Some(_) => {
                         if server.is_ready_to_connect() {
                             response.send(FResponseMessage::ConnectStart(Ok(ConnectInfo {
                                 address: String::default(),
-                                port: 0
+                                port: 0,
                             })));
                         } else {
                             response.send(FResponseMessage::ConnectStart(Err(
-                                QueryError::NotAllClientsReady
+                                QueryError::NotAllClientsReady,
                             )));
                         }
-
                     }
                     None => {
                         response.send(FResponseMessage::ConnectStart(Err(
                             QueryError::InvalidToken,
                         )));
+                    }
+                },
+                // Set the connection state and tell all other clients
+                // that you connected
+                FRequestMessage::ConnectConfirm(token) => match server.validate_token(&token) {
+                    Some(client) => {
+                        let id = client.id();
+                        server.set_client_connect(id);
+
+                        let timestamp = Utc::now().timestamp();
+                        server.broadcast_game_packet(
+                            Packet::new(
+                                0,
+                                0,
+                                id,
+                                timestamp as u64,
+                                1,
+                                PacketMessage::StartResponse(id, server.all_clients_connected()),
+                            ),
+                            vec![],
+                        );
+                        response.send(FResponseMessage::ConnectConfirm(Ok(())));
+                    }
+                    None => {
+                        response.send(FResponseMessage::ConnectConfirm(Err(
+                            QueryError::InvalidToken,
+                        )));
+                    }
+                },
+                FRequestMessage::PopGameMessage(token) => match server.validate_token(&token) {
+                    Some(client) => {
+                        let id = client.id();
+                        response.send(FResponseMessage::PopGameMessage(server.pop_game_packet(id)));
+                    }
+                    None => {
+                        response.send(FResponseMessage::PopGameMessage(None));
                     }
                 },
                 FRequestMessage::GetClientCount => {
@@ -313,7 +361,7 @@ pub async fn send_info_message(
     token: &str,
 ) -> Result<ServerInfo, QueryError> {
     match send_validate_login_message(sender, &token).await {
-        Ok(login) => {
+        Ok(_) => {
             let (resp_tx, resp_rx) = oneshot::channel();
 
             sender
@@ -338,7 +386,7 @@ pub async fn send_logout_message(
     token: &str,
 ) -> Result<u64, QueryError> {
     match send_validate_login_message(sender, &token).await {
-        Ok(login) => {
+        Ok(_) => {
             let (resp_tx, resp_rx) = oneshot::channel();
 
             sender
@@ -367,7 +415,7 @@ pub async fn send_get_client_message(
     client_id: u64,
 ) -> Result<ClientInfo, QueryError> {
     match send_validate_login_message(sender, &token).await {
-        Ok(login) => {
+        Ok(_) => {
             let (resp_tx, resp_rx) = oneshot::channel();
 
             sender
@@ -445,7 +493,7 @@ pub async fn send_connect_message(
     token: &str,
 ) -> Result<ConnectInfo, QueryError> {
     match send_validate_login_message(sender, &token).await {
-        Ok(login) => {
+        Ok(_) => {
             let (resp_tx, resp_rx) = oneshot::channel();
 
             sender
@@ -465,3 +513,64 @@ pub async fn send_connect_message(
     }
 }
 
+pub async fn send_connect_confirm_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+) -> Result<(), QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(_) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((
+                    FRequestMessage::ConnectConfirm(String::from(token)),
+                    resp_tx,
+                ))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::ConnectConfirm(res) = res {
+                res
+            } else {
+                panic!("Unexpected response on ConnectConfirm")
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+///
+/// Pop the game packet for the client whose token is `token`
+///
+/// Return the packet data, or an error
+/// We can have no packet, in this case it will return a None.
+/// Otherwise, a Some(...) will be returned.
+pub async fn send_pop_game_packet_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+) -> Result<Option<Packet>, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(_) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((
+                    FRequestMessage::PopGameMessage(String::from(token)),
+                    resp_tx,
+                ))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::PopGameMessage(res) = res {
+                Ok(res)
+            } else {
+                panic!("Unexpected response on ConnectConfirm")
+            }
+        }
+        Err(e) => Err(e),
+    }
+}

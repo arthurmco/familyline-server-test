@@ -158,10 +158,7 @@ pub async fn run_discovery_thread(config: &ServerConfiguration, sender: Sender<F
     let mut udp_discover = UdpSocket::bind(format!("{}:1983", laddr)).await.unwrap();
     tokio::spawn(async move {
         udp_discover
-            .join_multicast_v4(
-                "239.255.255.250".parse().unwrap(),
-                laddr.parse().unwrap(),
-            )
+            .join_multicast_v4("239.255.255.250".parse().unwrap(), laddr.parse().unwrap())
             .unwrap();
         println!("Server is discoverable!");
         loop {
