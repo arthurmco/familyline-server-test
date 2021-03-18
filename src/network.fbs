@@ -9,9 +9,29 @@ table StartResponse {
     all_clients_ack: bool;
 }
 
+table LoadingRequest  {
+    percent: ushort;
+}
+
+table LoadingResponse  {
+    percent: ushort;
+}
+
+table GameStartRequest  {
+    reserved: uint;
+}
+
+table GameStartResponse  {
+    reserved: uint;
+}
+
 union Message {
     sreq: StartRequest,
     sres: StartResponse,
+    lreq: LoadingRequest,
+    lres: LoadingResponse,
+    greq: GameStartRequest,
+    gres: GameStartResponse
 }
 
 table NetPacket {
