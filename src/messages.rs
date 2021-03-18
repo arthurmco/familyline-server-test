@@ -295,6 +295,10 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                             _ => true,
                         };
 
+                        if rres {
+                            server.act_on_packet(&packet);
+                        }
+
                         if packet.source_client == packet.dest_client {
                             // cannot send a message to yourself.
                             response.send(FResponseMessage::PushGameMessage(false));

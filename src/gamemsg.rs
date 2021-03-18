@@ -15,14 +15,18 @@ use tokio::{
     sync::mpsc::Sender,
 };
 
-#[allow(dead_code, unused_imports)]
-#[path = "./network_generated.rs"]
-mod network_generated;
-pub use network_generated::{
+use crate::network_generated::{
     get_root_as_net_packet, GameStartRequest, GameStartRequestArgs, GameStartResponse,
-    GameStartResponseArgs, LoadingRequest, LoadingRequestArgs, LoadingResponse,
-    LoadingResponseArgs, Message, NetPacket, NetPacketArgs, StartRequest, StartRequestArgs,
-    StartResponse, StartResponseArgs,
+    GameStartResponseArgs, InputRequest, InputRequestArgs, InputResponse, InputResponseArgs,
+    LoadingRequest, LoadingRequestArgs, LoadingResponse, LoadingResponseArgs, Message, NetPacket,
+    NetPacketArgs, StartRequest, StartRequestArgs, StartResponse, StartResponseArgs,
+};
+
+use crate::input_generated::InputType as SerInputType;
+use crate::input_generated::{
+    CameraMove, CameraMoveArgs, CameraRotate, CameraRotateArgs, CommandInput, CommandInputA,
+    CommandInputAArgs, CommandInputArgs, CreateEntity, CreateEntityArgs, ObjectMove,
+    ObjectMoveArgs, SelectAction, SelectActionArgs, SelectActionObjects, SelectActionObjectsArgs,
 };
 
 #[derive(Debug, Clone)]
@@ -39,6 +43,8 @@ pub enum InputType {
     CameraMove(f64, f64, f64),
     CameraRotate(f64),
     CreateEntity(String, f64, f64),
+
+    Invalid,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +174,52 @@ impl Packet {
                 }
                 Message::greq => PacketMessage::GameStartRequest,
                 Message::gres => PacketMessage::GameStartResponse,
+                Message::ireq => {
+                    let m = p.message_as_ireq().unwrap();
+                    let client = m.client_from();
+
+                    let msg = match m.input_msg_type() {
+                        SerInputType::NONE => InputType::Invalid,
+                        SerInputType::create => {
+                            let tm = m.input_msg_as_create().unwrap();
+                            InputType::CreateEntity(
+                                tm.type_().map(|v| String::from(v)).unwrap_or_default(),
+                                tm.x_pos() as f64,
+                                tm.y_pos() as f64,
+                            )
+                        }
+                        SerInputType::cmd => {
+                            let tm = m.input_msg_as_cmd().unwrap();
+                            let args: Vec<u64> = tm
+                                .args()
+                                .map(|a| a.args().unwrap().iter().collect())
+                                .unwrap_or_default();
+                            InputType::CommandInput(String::from(tm.command()), args)
+                        }
+                        SerInputType::cam_move => {
+                            let tm = m.input_msg_as_cam_move().unwrap();
+                            InputType::CameraMove(tm.x_delta(), tm.y_delta(), tm.zoom_delta())
+                        }
+                        SerInputType::cam_rotate => {
+                            let tm = m.input_msg_as_cam_rotate().unwrap();
+                            InputType::CameraRotate(tm.radians())
+                        }
+                        SerInputType::obj_move => {
+                            let tm = m.input_msg_as_obj_move().unwrap();
+                            InputType::ObjectMove(tm.x_pos() as u64, tm.y_pos() as u64)
+                        }
+                        SerInputType::sel => {
+                            let tm = m.input_msg_as_sel().unwrap();
+                            let objs: Vec<u64> = tm.objects().values().iter().collect();
+                            InputType::SelectAction(objs)
+                        }
+                    };
+                    PacketMessage::SendInputRequest(client, msg)
+                }
+                Message::ires => {
+                    let m = p.message_as_ires().unwrap();
+                    PacketMessage::SendInputResponse(m.client_from(), m.client_ack())
+                }
                 Message::NONE => {
                     println!("invalid message received!");
                     PacketMessage::Invalid
@@ -221,6 +273,103 @@ impl Packet {
             PacketMessage::GameStartResponse => {
                 let c = GameStartResponse::create(builder, &GameStartResponseArgs { reserved: 0 });
                 (Message::gres, Some(c.as_union_value()))
+            }
+            PacketMessage::SendInputRequest(client_from, mtype) => {
+                let (input_msg_type, input_msg) = match mtype {
+                    InputType::Invalid => (SerInputType::NONE, None),
+                    InputType::CameraMove(x, y, zoom) => {
+                        let mc = CameraMove::create(
+                            builder,
+                            &CameraMoveArgs {
+                                x_delta: *x,
+                                y_delta: *y,
+                                zoom_delta: *zoom,
+                            },
+                        );
+                        (SerInputType::cam_move, Some(mc.as_union_value()))
+                    }
+                    InputType::CameraRotate(rads) => {
+                        let mc =
+                            CameraRotate::create(builder, &CameraRotateArgs { radians: *rads });
+                        (SerInputType::cam_rotate, Some(mc.as_union_value()))
+                    }
+                    InputType::CommandInput(cmd, params) => {
+                        let vparams = builder.create_vector(&params[..]);
+                        let scmd = builder.create_string(&cmd);
+                        let cargs = CommandInputA::create(
+                            builder,
+                            &CommandInputAArgs {
+                                args: Some(vparams),
+                            },
+                        );
+                        let mc = CommandInput::create(
+                            builder,
+                            &CommandInputArgs {
+                                command: Some(scmd),
+                                args: Some(cargs),
+                            },
+                        );
+                        (SerInputType::cmd, Some(mc.as_union_value()))
+                    }
+                    InputType::CreateEntity(etype, x, y) => {
+                        let stype = builder.create_string(&etype);
+                        let mc = CreateEntity::create(
+                            builder,
+                            &CreateEntityArgs {
+                                type_: Some(stype),
+                                x_pos: *x as u32,
+                                y_pos: *y as u32,
+                            },
+                        );
+                        (SerInputType::create, Some(mc.as_union_value()))
+                    }
+                    InputType::ObjectMove(x, y) => {
+                        let mc = ObjectMove::create(
+                            builder,
+                            &ObjectMoveArgs {
+                                x_pos: *x as u32,
+                                y_pos: *y as u32,
+                            },
+                        );
+                        (SerInputType::obj_move, Some(mc.as_union_value()))
+                    }
+                    InputType::SelectAction(entities) => {
+                        let eparams = builder.create_vector(&entities[..]);
+                        let eargs = SelectActionObjects::create(
+                            builder,
+                            &SelectActionObjectsArgs {
+                                values: Some(eparams),
+                            },
+                        );
+                        let mc = SelectAction::create(
+                            builder,
+                            &SelectActionArgs {
+                                objects: Some(eargs),
+                            },
+                        );
+                        (SerInputType::sel, Some(mc.as_union_value()))
+                    }
+                };
+
+                let c = InputRequest::create(
+                    builder,
+                    &InputRequestArgs {
+                        client_from: *client_from,
+                        input_msg_type,
+                        input_msg,
+                    },
+                );
+                (Message::ireq, Some(c.as_union_value()))
+            }
+            PacketMessage::SendInputResponse(client_from, client_ack) => {
+                let c = InputResponse::create(
+                    builder,
+                    &InputResponseArgs {
+                        client_from: *client_from,
+                        client_ack: *client_ack,
+                    },
+                );
+                (Message::ires, Some(c.as_union_value()))
             }
             PacketMessage::Invalid => panic!("wtf creating an invalid package? why? "),
             _ => unimplemented!(),
@@ -397,7 +546,8 @@ pub async fn handle_packet(packet: Packet, sender: &mut Sender<FMessage>, token:
                             .to_new_client(npacket.source_client)
                             .to_new_message(PacketMessage::LoadingResponse(percent)),
                     )
-                    .await.unwrap();
+                    .await
+                    .unwrap();
                     send_push_game_packet_message(
                         sender,
                         token,
@@ -405,7 +555,8 @@ pub async fn handle_packet(packet: Packet, sender: &mut Sender<FMessage>, token:
                             .to_new_client(0)
                             .to_new_message(PacketMessage::LoadingResponse(percent)),
                     )
-                    .await.unwrap();
+                    .await
+                    .unwrap();
                 }
                 PacketMessage::GameStartRequest => {
                     send_push_game_packet_message(
@@ -415,7 +566,9 @@ pub async fn handle_packet(packet: Packet, sender: &mut Sender<FMessage>, token:
                             .make_server_own()
                             .to_new_client(npacket.source_client)
                             .to_new_message(PacketMessage::GameStartResponse),
-                    ).await.unwrap();
+                    )
+                    .await
+                    .unwrap();
                     send_push_game_packet_message(
                         sender,
                         token,
@@ -423,7 +576,13 @@ pub async fn handle_packet(packet: Packet, sender: &mut Sender<FMessage>, token:
                             .to_new_client(0)
                             .to_new_message(PacketMessage::GameStartResponse),
                     )
-                    .await.unwrap();
+                    .await
+                    .unwrap();
+                }
+                PacketMessage::SendInputRequest(_, _) => {
+                    send_push_game_packet_message(sender, token, npacket.to_new_client(0))
+                        .await
+                        .unwrap();
                 }
                 _ => {}
             },

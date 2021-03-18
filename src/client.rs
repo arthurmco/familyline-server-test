@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use chrono::{offset::Utc, DateTime};
 
 use crate::config::ServerConfiguration;
-use crate::gamemsg::Packet;
+use crate::gamemsg::{Packet, PacketMessage};
 
 #[derive(Debug, Clone)]
 pub enum ChatReceiver {
@@ -54,6 +54,12 @@ pub struct FClient {
     receive_queue: VecDeque<ChatMessage>,
 
     game_packets: VecDeque<Packet>,
+
+    /// The last ack'd input tick, and the timestamp, for this client
+    ///
+    /// Useful to determine if a client is stuck, or late
+    last_confirmed_input_tick: u64,
+    last_confirmed_input_timestamp: u64,
 }
 
 impl FClient {
@@ -76,6 +82,8 @@ impl FClient {
             receive_queue: VecDeque::new(),
             last_receive_sent_request: Utc::now(),
             game_packets: VecDeque::new(),
+            last_confirmed_input_tick: 0,
+            last_confirmed_input_timestamp: 0,
         }
     }
 
@@ -90,6 +98,11 @@ impl FClient {
             content,
             store_date: Utc::now(),
         });
+    }
+
+    pub fn update_last_packet_info(&mut self, tick: u64, timestamp: u64) {
+        self.last_confirmed_input_timestamp = timestamp;
+        self.last_confirmed_input_tick = tick;
     }
 
     /// Push a game packet into this client queue
@@ -309,10 +322,29 @@ impl FServer {
         }
     }
 
+    /// Update the client state based on a certain packet
+    pub fn act_on_packet(&mut self, p: &Packet) {
+        match p.message {
+            PacketMessage::SendInputResponse(id, true) => {
+                match self.get_client_mut(id) {
+                    Some(c) => {
+                        c.update_last_packet_info(p.tick, p.timestamp);
+                    }
+                    None => {
+                        ();
+                    }
+                };
+            }
+            _ => (),
+        }
+    }
+
     /// Push a packet to a client
     pub fn push_game_packet(&mut self, client_id: u64, p: Packet) {
         match self.get_client_mut(client_id) {
-            Some(c) => c.push_game_packet(p),
+            Some(c) => {
+                c.push_game_packet(p);
+            }
             None => {
                 ();
             }

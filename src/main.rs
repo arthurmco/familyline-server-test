@@ -2,21 +2,22 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use warp::{
-    http::{StatusCode},
-    ws::WebSocket,
-    Filter,
-};
+use warp::{http::StatusCode, ws::WebSocket, Filter};
 
-use tokio::{
-    sync::mpsc::{Sender},
-};
+use tokio::sync::mpsc::Sender;
 
 mod broadcast;
 mod client;
 mod config;
 mod gamemsg;
 mod messages;
+
+#[allow(dead_code, unused_imports)]
+#[path = "./network_generated.rs"]
+mod network_generated;
+
+#[path = "./input_generated.rs"]
+mod input_generated;
 
 use config::ServerConfiguration;
 
@@ -48,9 +49,9 @@ use std::time::Duration;
  * start
  *
  * After the client calls /connect, it is supposed to connect to the
- * game server port  (the game server is the one managed by 
+ * game server port  (the game server is the one managed by
  * `run_game_server_thread`)
- * 
+ *
  * TODO: how an spectator will connect?
  */
 

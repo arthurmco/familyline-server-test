@@ -1,4 +1,6 @@
 
+include "input.fbs";
+
 table StartRequest {
     client_id: ulong;
     token: string;    
@@ -25,13 +27,25 @@ table GameStartResponse  {
     reserved: uint;
 }
 
+table InputRequest {
+    client_from:  ulong;
+    input_msg: InputType;
+}
+
+table InputResponse {
+    client_from: ulong;
+    client_ack: bool;
+}
+
 union Message {
     sreq: StartRequest,
     sres: StartResponse,
     lreq: LoadingRequest,
     lres: LoadingResponse,
     greq: GameStartRequest,
-    gres: GameStartResponse
+    gres: GameStartResponse,
+    ireq: InputRequest,
+    ires: InputResponse
 }
 
 table NetPacket {
