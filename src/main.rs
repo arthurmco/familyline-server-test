@@ -47,6 +47,10 @@ use std::time::Duration;
  * Also, the chat websocket is the only endpoint that works after a game
  * start
  *
+ * After the client calls /connect, it is supposed to connect to the
+ * game server port  (the game server is the one managed by 
+ * `run_game_server_thread`)
+ * 
  * TODO: how an spectator will connect?
  */
 

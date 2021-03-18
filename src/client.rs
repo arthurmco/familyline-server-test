@@ -24,7 +24,7 @@ pub struct ChatMessage {
 }
 
 /// Client state
-#[derive(PartialEq, Copy, Clone)]
+#[derive(PartialEq, Copy, Clone, Debug)]
 pub enum ClientState {
     /// Client just connected, it is in the game setup screen
     InGameSetup,
@@ -35,13 +35,14 @@ pub enum ClientState {
     /// Client connected to the game server
     InGameConnect,
 
-    /// All clients are ready, game is starting
+    /// All clients are ready, game is loading
     InGameStart,
 
-    /// Client connected to the game socket; the game is started or already started
+    /// Client loaded everything, game is started
     InGame,
 }
 
+#[derive(Debug)]
 pub struct FClient {
     pub name: String,
     pub id: u64,
@@ -155,6 +156,31 @@ impl FClient {
         return ret;
     }
 
+    pub fn set_game_start(&mut self) -> bool {
+        let (nstate, ret) = match self.state {
+            ClientState::InGameConnect => (ClientState::InGameStart, true),
+            ClientState::InGameStart => (ClientState::InGameStart, true),
+            _ => (self.state, false),
+        };
+
+        self.state = nstate;
+        return ret;
+    }
+
+    /// The game is ready to begin!
+    ///
+    /// The client is ready to receive inputs
+    pub fn set_ready_to_receive_inputs(&mut self) -> bool {
+        let (nstate, ret) = match self.state {
+            ClientState::InGameStart => (ClientState::InGame, true),
+            ClientState::InGame => (ClientState::InGame, true),
+            _ => (self.state, false),
+        };
+
+        self.state = nstate;
+        return ret;
+    }
+
     pub fn get_received_messages(&self) -> Vec<ChatMessage> {
         self.receive_queue
             .iter()
@@ -231,6 +257,28 @@ impl FServer {
             None => false,
         }
     }
+
+    /// Set a client to starting state
+    ///
+    /// Return true if the set was successful, false if it was not
+    pub fn set_client_starting(&mut self, client_id: u64) -> bool {
+        match self.get_client_mut(client_id) {
+            Some(c) => c.set_game_start(),
+            None => false,
+        }
+    }
+
+    /// Set the client in a state where it is ready to receive
+    /// inputs
+    ///
+    /// Return true if the set was successful, false if it was not
+    pub fn set_client_start_to_receive_inputs(&mut self, client_id: u64) -> bool {
+        match self.get_client_mut(client_id) {
+            Some(c) => c.set_ready_to_receive_inputs(),
+            None => false,
+        }
+    }
+
     /// Is all clients ready to connect?
     ///
     /// This means more than one client, and all clients ready
@@ -253,7 +301,6 @@ impl FServer {
             .for_each(|c| c.push_game_packet(p.to_new_client(c.id())))
     }
 
-
     /// Pop a packet from a client
     pub fn pop_game_packet(&mut self, client_id: u64) -> Option<Packet> {
         match self.get_client_mut(client_id) {
@@ -262,6 +309,15 @@ impl FServer {
         }
     }
 
+    /// Push a packet to a client
+    pub fn push_game_packet(&mut self, client_id: u64, p: Packet) {
+        match self.get_client_mut(client_id) {
+            Some(c) => c.push_game_packet(p),
+            None => {
+                ();
+            }
+        };
+    }
     /// Return true if all clients are connected, i.e, all
     /// clients called the /connect endpoint, and identified
     /// themselves in the game server port.
@@ -273,7 +329,6 @@ impl FServer {
             _ => false,
         })
     }
-    
 
     /// Check what user do this token belongs
     ///

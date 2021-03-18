@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum LoginError {}
 
 /// General Errors
+#[derive(Debug)]
 pub enum QueryError {
     InvalidToken,
     ClientNotFound,
@@ -105,6 +106,7 @@ pub enum FRequestMessage {
     ReceiveMessages(String),
 
     ConnectConfirm(String),
+    CheckAllClientsConnected(String),
     PushGameMessage(String, Packet),
     PopGameMessage(String),
 }
@@ -127,7 +129,8 @@ pub enum FResponseMessage {
     ReceiveMessages(Vec<ChatMessage>),
 
     ConnectConfirm(Result<(), QueryError>),
-    PushGameMessage(),
+    CheckAllClientsConnected(bool),
+    PushGameMessage(bool),
     PopGameMessage(Option<Packet>),
 }
 
@@ -244,6 +247,73 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
                         )));
                     }
                 },
+                FRequestMessage::CheckAllClientsConnected(token) => {
+                    match server.validate_token(&token) {
+                        Some(_) => {
+                            response.send(FResponseMessage::CheckAllClientsConnected(
+                                server.all_clients_connected(),
+                            ));
+                        }
+                        None => {
+                            response.send(FResponseMessage::CheckAllClientsConnected(false));
+                        }
+                    }
+                }
+                FRequestMessage::PushGameMessage(token, packet) => {
+                    let cid = match server.validate_token(&token) {
+                        Some(client) => client.id(),
+                        None => 0,
+                    };
+
+                    if cid > 0 {
+                        let rres = match packet.message {
+                            PacketMessage::LoadingRequest(_) => {
+                                if !server.set_client_starting(cid) {
+                                    eprintln!("Invalid state transition to starting ({:?})", cid);
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                            PacketMessage::GameStartRequest => {
+                                if !server.set_client_start_to_receive_inputs(cid) {
+                                    eprintln!("Invalid state transition to game ({:?})", cid);
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                            PacketMessage::SendInputRequest(_, _) => {
+                                match server.get_client(cid).unwrap().get_state() {
+                                    ClientState::InGame => true,
+                                    _ => {
+                                        eprintln!("Invalid state for receiving this message");
+                                        false
+                                    }
+                                }
+                            }
+                            _ => true,
+                        };
+
+                        if packet.source_client == packet.dest_client {
+                            // cannot send a message to yourself.
+                            response.send(FResponseMessage::PushGameMessage(false));
+                        } else if packet.dest_client == 0 {
+                            // handle the broadcasting case
+                            if rres {
+                                server.broadcast_game_packet(packet, vec![cid]);
+                            }
+                            response.send(FResponseMessage::PushGameMessage(rres));
+                        } else {
+                            if rres {
+                                server.push_game_packet(packet.dest_client, packet);
+                            }
+                            response.send(FResponseMessage::PushGameMessage(rres));
+                        }
+                    } else {
+                        response.send(FResponseMessage::PushGameMessage(false));
+                    }
+                }
                 FRequestMessage::PopGameMessage(token) => match server.validate_token(&token) {
                     Some(client) => {
                         let id = client.id();
@@ -568,7 +638,64 @@ pub async fn send_pop_game_packet_message(
             if let FResponseMessage::PopGameMessage(res) = res {
                 Ok(res)
             } else {
-                panic!("Unexpected response on ConnectConfirm")
+                panic!("Unexpected response on send_pop_game_packet_message")
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn send_push_game_packet_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+    p: Packet,
+) -> Result<bool, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(_) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((
+                    FRequestMessage::PushGameMessage(String::from(token), p),
+                    resp_tx,
+                ))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::PushGameMessage(res) = res {
+                Ok(res)
+            } else {
+                panic!("Unexpected response on send_push_game_packet_message")
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn send_check_all_clients_connected_message(
+    sender: &mut Sender<FMessage>,
+    token: &str,
+) -> Result<bool, QueryError> {
+    match send_validate_login_message(sender, &token).await {
+        Ok(_) => {
+            let (resp_tx, resp_rx) = oneshot::channel();
+
+            sender
+                .send((
+                    FRequestMessage::CheckAllClientsConnected(String::from(token)),
+                    resp_tx,
+                ))
+                .await
+                .ok()
+                .unwrap();
+            let res = resp_rx.await.unwrap();
+
+            if let FResponseMessage::CheckAllClientsConnected(res) = res {
+                Ok(res)
+            } else {
+                panic!("Unexpected response on send_check_all_clients_connected_message")
             }
         }
         Err(e) => Err(e),

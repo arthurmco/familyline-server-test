@@ -4,9 +4,11 @@ extern crate flatbuffers;
 
 use crate::config::ServerConfiguration;
 use crate::messages::{
-    send_connect_confirm_message, send_pop_game_packet_message, FMessage, FRequestMessage,
+    send_check_all_clients_connected_message, send_connect_confirm_message,
+    send_pop_game_packet_message, send_push_game_packet_message, FMessage, FRequestMessage,
     FResponseMessage,
 };
+use chrono::prelude::*;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Interest},
@@ -17,14 +19,58 @@ use tokio::{
 #[path = "./network_generated.rs"]
 mod network_generated;
 pub use network_generated::{
-    get_root_as_net_packet, Message, NetPacket, NetPacketArgs, StartRequest, StartRequestArgs,
+    get_root_as_net_packet, GameStartRequest, GameStartRequestArgs, GameStartResponse,
+    GameStartResponseArgs, LoadingRequest, LoadingRequestArgs, LoadingResponse,
+    LoadingResponseArgs, Message, NetPacket, NetPacketArgs, StartRequest, StartRequestArgs,
     StartResponse, StartResponseArgs,
 };
+
+#[derive(Debug, Clone)]
+pub enum InputType {
+    /// Command input: the command name + its args
+    CommandInput(String, Vec<u64>),
+
+    /// Select action: the IDs of the selected objects
+    SelectAction(Vec<u64>),
+
+    /// Object move: where do the selected objects will move?
+    ObjectMove(u64, u64),
+
+    CameraMove(f64, f64, f64),
+    CameraRotate(f64),
+    CreateEntity(String, f64, f64),
+}
 
 #[derive(Debug, Clone)]
 pub enum PacketMessage {
     StartRequest(u64, String),
     StartResponse(u64, bool),
+
+    LoadingRequest(u16),
+    LoadingResponse(u16),
+
+    GameStartRequest,
+    GameStartResponse,
+
+    /// Send a input
+    ///
+    /// The u64 is the client that originally sent the input
+    /// The input type is the data of the input
+    SendInputRequest(u64, InputType),
+
+    /// Send a input, the response
+    ///
+    /// The u64 is the client that originally sent the input
+    /// The bool is an ack field, that the server processed the
+    /// packet and sent it to all clients.
+    SendInputResponse(u64, bool),
+
+    /// A request for disconnection.
+    ///
+    /// The u64 is the client ID of the disconnector.
+    DisconnectRequest(u64),
+    DisconnectResponse(u64),
+
     Invalid,
 }
 
@@ -63,12 +109,32 @@ impl Packet {
         }
     }
 
+    /// Make the server own the packet
+    ///
+    /// Also reset the packet timestamp.
+    pub fn make_server_own(&self) -> Packet {
+        Packet {
+            source_client: 0 as u64,
+            timestamp: Utc::now().timestamp() as u64,
+            message: self.message.clone(),
+            ..*self
+        }
+    }
+
     /// Set the destination client of the message, and create
     /// a new packet for that
     pub fn to_new_client(&self, newclient: u64) -> Packet {
         Packet {
             dest_client: newclient,
             message: self.message.clone(),
+            ..*self
+        }
+    }
+
+    /// Set the packet message, and create a new packet for that.
+    pub fn to_new_message(&self, msg: PacketMessage) -> Packet {
+        Packet {
+            message: msg,
             ..*self
         }
     }
@@ -92,6 +158,16 @@ impl Packet {
                     let m = p.message_as_sres().unwrap();
                     PacketMessage::StartResponse(m.client_ack(), m.all_clients_ack())
                 }
+                Message::lreq => {
+                    let m = p.message_as_lreq().unwrap();
+                    PacketMessage::LoadingRequest(m.percent())
+                }
+                Message::lres => {
+                    let m = p.message_as_lres().unwrap();
+                    PacketMessage::LoadingResponse(m.percent())
+                }
+                Message::greq => PacketMessage::GameStartRequest,
+                Message::gres => PacketMessage::GameStartResponse,
                 Message::NONE => {
                     println!("invalid message received!");
                     PacketMessage::Invalid
@@ -129,7 +205,25 @@ impl Packet {
                 );
                 (Message::sres, Some(c.as_union_value()))
             }
+            PacketMessage::LoadingRequest(percent) => {
+                let c = LoadingRequest::create(builder, &LoadingRequestArgs { percent: *percent });
+                (Message::lreq, Some(c.as_union_value()))
+            }
+            PacketMessage::LoadingResponse(percent) => {
+                let c =
+                    LoadingResponse::create(builder, &LoadingResponseArgs { percent: *percent });
+                (Message::lres, Some(c.as_union_value()))
+            }
+            PacketMessage::GameStartRequest => {
+                let c = GameStartRequest::create(builder, &GameStartRequestArgs { reserved: 0 });
+                (Message::greq, Some(c.as_union_value()))
+            }
+            PacketMessage::GameStartResponse => {
+                let c = GameStartResponse::create(builder, &GameStartResponseArgs { reserved: 0 });
+                (Message::gres, Some(c.as_union_value()))
+            }
             PacketMessage::Invalid => panic!("wtf creating an invalid package? why? "),
+            _ => unimplemented!(),
         }
     }
 
@@ -276,6 +370,76 @@ pub async fn wait_for_identification(socket: &mut TcpStream) -> Option<String> {
     }
 }
 
+pub async fn handle_packet(packet: Packet, sender: &mut Sender<FMessage>, token: &str) {
+    {
+        println!(
+            "Packet: {:?} (tick {}, source {}, dest {}, timestamp {}, id {}, type {:?})",
+            packet,
+            packet.tick,
+            packet.source_client,
+            packet.dest_client,
+            packet.timestamp,
+            packet.message_id,
+            packet.message
+        );
+    }
+
+    let npacket = packet.clone();
+    match send_check_all_clients_connected_message(sender, token).await {
+        Ok(true) => match send_push_game_packet_message(sender, token, packet).await {
+            Ok(true) => match npacket.message {
+                PacketMessage::LoadingRequest(percent) => {
+                    send_push_game_packet_message(
+                        sender,
+                        token,
+                        npacket
+                            .make_server_own()
+                            .to_new_client(npacket.source_client)
+                            .to_new_message(PacketMessage::LoadingResponse(percent)),
+                    )
+                    .await.unwrap();
+                    send_push_game_packet_message(
+                        sender,
+                        token,
+                        npacket
+                            .to_new_client(0)
+                            .to_new_message(PacketMessage::LoadingResponse(percent)),
+                    )
+                    .await.unwrap();
+                }
+                PacketMessage::GameStartRequest => {
+                    send_push_game_packet_message(
+                        sender,
+                        token,
+                        npacket
+                            .make_server_own()
+                            .to_new_client(npacket.source_client)
+                            .to_new_message(PacketMessage::GameStartResponse),
+                    ).await.unwrap();
+                    send_push_game_packet_message(
+                        sender,
+                        token,
+                        npacket
+                            .to_new_client(0)
+                            .to_new_message(PacketMessage::GameStartResponse),
+                    )
+                    .await.unwrap();
+                }
+                _ => {}
+            },
+            _ => panic!("Error while sending packet!"),
+        },
+        Ok(false) => {
+            // Only the initial packets can be sent without all clients
+            // be connected.
+            //
+            // Return an error.
+            println!("This is not the time for this packet yet!");
+        }
+        Err(_) => println!("Error while handling packet!"),
+    }
+}
+
 /// Run the game server thread
 ///
 /// Even if you connect, the game server will only accept your messages and answer them if
@@ -332,13 +496,12 @@ pub async fn run_game_server_thread(config: &ServerConfiguration, sender: Sender
 
                         match decode_packet(&data[..]) {
                             Some(packet) => {
-                                println!("Packet: {:?} (tick {}, source {}, dest {}, timestamp {}, id {}, type {:?})", 
-                                packet, packet.tick, packet.source_client,
-                                packet.dest_client, packet.timestamp, packet.message_id,
-                                packet.message);
+                                handle_packet(packet, &mut sender, &token);
                             }
-                            None => println!("Invalid packet of size {}", data.len()),
-                        }
+                            None => {
+                                println!("Invalid packet of size {}", data.len());
+                            }
+                        };
                     }
 
                     if ready.is_writable() {
