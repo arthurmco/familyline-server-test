@@ -19,8 +19,7 @@ Currently, I have only:
 
  - the basic discovery protocol, a very striped-down version of SSDP,
    that the client will use to find the server. The server binds to a
-   multicast address, the same as SSDP, but to a different port to avoid
-   issues.
+   multicast address, the same as SSDP, but to a different port to avoid issues.
  
  - most of the HTTP protocol that the game will use to query things to
    the server when on lobby, and probably to propose suggestions, like
@@ -29,16 +28,19 @@ Currently, I have only:
    There are some properties of the game, like game mode for example,
    that I will implement after I have a more or less working client on
    the game itself
+
+ - the most part of the in-game protocol messages working. There is 
+   no error treatment yet; I will do it once I have the basic 
+   networking OK
    
 
 The in-game protocol, that the game will use to send his inputs and
 receive other players' input, send and receive chat data,
-synchronization packets and verification packets, is not
-implemented. Not a single bit *yet*.  
-But I plan to use something like Protocol Buffers or FlatBuffers to
-encode it. They need you to define  a schema, and they encode the data
-in a more or less common format. The schema definition will of course
-help development.
+synchronization packets and verification packets, is a little bit
+implemented. Input data is OK, verification, synchronization, error
+checking are not.
+
+We use FlatBuffers to encode it. They need you to define  a schema, and they encode the data in a more or less common format. The schema definition will of course help development.
 
 -------
 
