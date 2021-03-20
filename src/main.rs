@@ -16,6 +16,7 @@ mod messages;
 #[path = "./network_generated.rs"]
 mod network_generated;
 
+#[allow(dead_code, unused_imports)]
 #[path = "./input_generated.rs"]
 mod input_generated;
 

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Errors that can happen if you try to login and
 /// generate the token
+#[derive(Debug)]
 pub enum LoginError {}
 
 /// General Errors
@@ -54,12 +55,21 @@ pub struct ClientInfo {
 
 impl From<&FClient> for ClientInfo {
     fn from(c: &FClient) -> Self {
+
+        let (ready, connecting, ingame) = match c.get_state() {
+            ClientState::InReady => (true, false, false),
+            ClientState::InGameConnect => (true, false, false),
+            ClientState::InGameStart => (true, true, false),
+            ClientState::InGame => (true, true, true),
+            _ => (false, false, false)
+        };
+
         ClientInfo {
             name: c.name.clone(),
             user_id: c.id,
-            ready: c.get_state() == ClientState::InReady,
-            connecting: c.get_state() == ClientState::InGameStart,
-            ingame: c.get_state() == ClientState::InGame,
+            ready,
+            connecting,
+            ingame,
         }
     }
 }
@@ -111,6 +121,7 @@ pub enum FRequestMessage {
     PopGameMessage(String),
 }
 
+#[derive(Debug)]
 pub enum FResponseMessage {
     Login(Result<LoginResult, LoginError>),
     ValidateLogin(Result<LoginResult, QueryError>),
@@ -444,6 +455,7 @@ pub async fn send_info_message(
                 .ok()
                 .unwrap();
             let res = resp_rx.await.unwrap();
+            println!("{:?}", res);
 
             if let FResponseMessage::GetServerInfo(res) = res {
                 Ok(res)

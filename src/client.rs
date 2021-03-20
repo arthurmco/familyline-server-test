@@ -301,7 +301,11 @@ impl FServer {
         } else {
             self.clients
                 .iter()
-                .all(|c| c.get_state() == ClientState::InReady)
+                .all(|c| match c.get_state() {
+                    ClientState::InReady => true,
+                    ClientState::InGameConnect => true,
+                    _ => false,
+                })
         }
     }
 

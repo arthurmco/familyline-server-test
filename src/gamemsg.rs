@@ -472,7 +472,7 @@ pub fn decode_packet(packet: &[u8]) -> Option<Packet> {
         return None;
     }
 
-    let payload = &packet[16..(psize - 16)];
+    let payload = &packet[16..(psize + 16)];
 
     let npacket = get_root_as_net_packet(&payload);
     Some(Packet::from_flatbuffers(npacket))
@@ -625,7 +625,14 @@ pub async fn run_game_server_thread(config: &ServerConfiguration, sender: Sender
                     }
                 };
 
-                println!("Client {} correctly identified", peer.to_string());
+                if vtoken {
+                    println!("Client {} correctly identified", peer.to_string());
+                } else {
+                    println!(
+                        "Client {} could not be identified, shutting down",
+                        peer.to_string()
+                    );
+                }
 
                 let mut size = [0u8; 1024];
                 let mut valid = vtoken;
@@ -655,7 +662,7 @@ pub async fn run_game_server_thread(config: &ServerConfiguration, sender: Sender
 
                         match decode_packet(&data[..]) {
                             Some(packet) => {
-                                handle_packet(packet, &mut sender, &token);
+                                handle_packet(packet, &mut sender, &token).await;
                             }
                             None => {
                                 println!("Invalid packet of size {}", data.len());
