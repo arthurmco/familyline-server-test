@@ -4,14 +4,14 @@ extern crate flatbuffers;
 
 use crate::config::ServerConfiguration;
 use crate::messages::{
-    send_check_all_clients_connected_message, send_connect_confirm_message,
+    send_check_all_clients_connected_message, send_connect_confirm_message, send_logout_message,
     send_pop_game_packet_message, send_push_game_packet_message, FMessage, FRequestMessage,
     FResponseMessage,
 };
 use chrono::prelude::*;
 use std::time::Duration;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, Interest},
+    io::{AsyncReadExt, AsyncWriteExt, ErrorKind, Interest},
     sync::mpsc::Sender,
 };
 
@@ -435,7 +435,7 @@ pub fn create_packet(packet: Packet) -> Vec<u8> {
 }
 
 /// Decode the network packet
-pub fn decode_packet(packet: &[u8]) -> Option<Packet> {
+pub fn decode_packet(packet: &[u8]) -> Option<Vec<Packet>> {
     if packet.len() <= 16 {
         return None;
     }
@@ -449,7 +449,8 @@ pub fn decode_packet(packet: &[u8]) -> Option<Packet> {
             }
         }
         Err(_) => return None, // Invalid message
-    };
+    };   
+
     let flags = packet[7] as u32 | ((packet[6] as u32) << 8) | ((packet[5] as u32) << 16);
     if flags != 0 {
         return None;
@@ -472,10 +473,24 @@ pub fn decode_packet(packet: &[u8]) -> Option<Packet> {
         return None;
     }
 
+    let mut ret = vec![];
     let payload = &packet[16..(psize + 16)];
-
     let npacket = get_root_as_net_packet(&payload);
-    Some(Packet::from_flatbuffers(npacket))
+    ret.push(Packet::from_flatbuffers(npacket));
+    
+    if packet.len() > psize+16 {
+        println!("!!!!: More than one packet on the same message");
+
+        println!("TODO: handle this ({} != {})", packet.len(), psize + 16);
+
+        match decode_packet(&packet[psize+16..]) {
+            None => {();},
+            Some(s) => { ret.extend(s); }
+        }
+    }
+
+    println!(">> {:?}", ret);
+    Some(ret)
 }
 
 /// Wait for the identification message
@@ -499,15 +514,16 @@ pub async fn wait_for_identification(socket: &mut TcpStream) -> Option<String> {
     };
 
     match decode_packet(&data[..]) {
-        Some(packet) => {
+        Some(packets) => {
+            let packet = packets.first().unwrap();
             if packet.tick > 0 {
                 return None;
             }
 
-            match packet.message {
+            match &packet.message {
                 PacketMessage::StartRequest(id, token) => {
-                    if id == packet.source_client {
-                        Some(token)
+                    if *id == packet.source_client {
+                        Some(String::from(token))
                     } else {
                         None
                     }
@@ -522,14 +538,8 @@ pub async fn wait_for_identification(socket: &mut TcpStream) -> Option<String> {
 pub async fn handle_packet(packet: Packet, sender: &mut Sender<FMessage>, token: &str) {
     {
         println!(
-            "Packet: {:?} (tick {}, source {}, dest {}, timestamp {}, id {}, type {:?})",
-            packet,
-            packet.tick,
-            packet.source_client,
-            packet.dest_client,
-            packet.timestamp,
-            packet.message_id,
-            packet.message
+            "Packet: {:?}",
+            packet
         );
     }
 
@@ -637,19 +647,24 @@ pub async fn run_game_server_thread(config: &ServerConfiguration, sender: Sender
                 let mut size = [0u8; 1024];
                 let mut valid = vtoken;
                 while valid {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+
                     let ready = socket
                         .ready(Interest::READABLE | Interest::WRITABLE)
                         .await
                         .unwrap();
 
                     if ready.is_readable() {
-                        let data = match socket.read(&mut size[..]).await {
-                            Ok(s) => {
-                                if s == 0 {
-                                    valid = false;
-                                }
-                                size[0..s].to_vec()
+                        let data = match socket.try_read(&mut size[..]) {
+                            Ok(0) => {
+                                // TODO: this is temporary, and will be removed once we support
+                                // client reconnection. But, for now, disconnect the client from // // the other server
+                                send_logout_message(&mut sender, &token).await.unwrap();
+                                valid = false;
+                                vec![]
                             }
+                            Ok(s) => size[0..s].to_vec(),
+                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => vec![],
                             Err(e) => {
                                 eprintln!("Error while reading: {:?}", e);
                                 valid = false;
@@ -660,45 +675,50 @@ pub async fn run_game_server_thread(config: &ServerConfiguration, sender: Sender
                             break;
                         }
 
-                        match decode_packet(&data[..]) {
-                            Some(packet) => {
-                                handle_packet(packet, &mut sender, &token).await;
-                            }
-                            None => {
-                                println!("Invalid packet of size {}", data.len());
-                            }
-                        };
-                    }
-
-                    if ready.is_writable() {
-                        let packet = match send_pop_game_packet_message(&mut sender, &token).await {
-                            Ok(p) => p,
-                            Err(_) => panic!("unexpected error!"),
-                        };
-
-                        match packet {
-                            Some(pkt) => {
-                                let pdata = create_packet(pkt);
-                                match socket.write(&pdata).await {
-                                    Ok(s) => {
-                                        if s <= 0 {
-                                            valid = false;
-                                        }
-                                        ()
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Error while writing: {:?}", e);
-                                        valid = false;
-                                        ()
+                        if data.len() > 0 {
+                            match decode_packet(&data[..]) {
+                                Some(packets) => {
+                                    for p in packets {
+                                        println!("received {:?}", p);
+                                        handle_packet(p, &mut sender, &token).await;
                                     }
                                 }
+                                None => {
+                                    println!("Invalid packet of size {}", data.len());
+                                }
+                            };
+                        }
+                    }
+
+                    let packet = match send_pop_game_packet_message(&mut sender, &token).await {
+                        Ok(p) => p,
+                        Err(_) => panic!("unexpected error!"),
+                    };
+
+                    match packet {
+                        Some(pkt) => {
+                            println!("new packet to be sent for {}: ({:?})", token, pkt);
+                            let pdata = create_packet(pkt);
+                            match socket.write(&pdata).await {
+                                Ok(s) => {
+                                    if s <= 0 {
+                                        valid = false;
+                                    }
+                                    ()
+                                }
+                                Err(e) => {
+                                    eprintln!("Error while writing: {:?}", e);
+                                    valid = false;
+                                    ()
+                                }
                             }
-                            None => {
-                                tokio::time::sleep(Duration::from_millis(1000)).await;
-                            }
+                        }
+                        None => {
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
                         }
                     }
                 }
+
                 println!("Client disconnected from: {}", peer.to_string());
             });
         }

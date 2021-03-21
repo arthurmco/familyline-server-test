@@ -165,7 +165,7 @@ pub fn start_message_processor(config: &ServerConfiguration) -> Sender<FMessage>
         let mut server = FServer::new(&config);
 
         while let Some((cmd, response)) = rx.recv().await {
-            println!("{:?}", cmd);
+            //println!("{:?}", cmd);
             match cmd {
                 FRequestMessage::Login(user) => {
                     let client = server.add_client(FClient::new(user));
